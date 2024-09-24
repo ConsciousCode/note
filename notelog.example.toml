@@ -1,0 +1,25 @@
+# Copy to the default config location and edit to your liking
+
+[database]
+file = "~/.local/notes.db"
+note_table = "notes"
+edit_table = "edits"
+
+[note]
+# May have a note
+may = [
+    "water", "pee", "poop", "masturbate",
+    "shower", "teeth", "nails", "shave",
+    "sleep", "nap", "wake"
+]
+
+# Must have a note
+must = [
+    "begin", "fail", "complete",
+    "note", "dream", "health",
+    "food", "coffee"
+]
+
+# Must have one of these notes
+[note.limit]
+coffee = ["begin", "complete"]
