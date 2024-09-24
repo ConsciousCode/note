@@ -28,6 +28,8 @@ LIMIT = {
     "coffee": {"begin", "complete"}
 }
 
+## Regex ##
+
 UNITS = '(?:secs?|seconds?|mins?|minutes?|hrs?|hours?|[smh])'
 RANGE_RE = re.compile(r"([\da-f]+)-([\da-f]+)")
 DELTA_RE = re.compile(rf"([+-]?)\s*(\d+)\s*({UNITS})")
@@ -50,6 +52,8 @@ CREATE TABLE IF NOT EXISTS {notes} (
 );
 '''
 
+## Classes ##
+
 class CmdError(RuntimeError):
     pass
 
@@ -68,114 +72,11 @@ class NoteRow(NamedTuple):
     tag: str
     note: str
 
-def get_config(db_fn: Optional[str], fn: str) -> Config:
-    import tomllib
-    
-    try:
-        with open(fn, 'rb') as f:
-            data: dict[str, Any] = tomllib.load(f)
-    except FileNotFoundError:
-        data = {}
-    
-    db = data.get("database", {})
-    note = data.get("note", {})
-    
-    return Config(
-        db.get("file", db_fn or DB_FILE),
-        db.get("note_table", DB_NOTE_TABLE),
-        db.get("edit_table", DB_EDIT_TABLE),
-        set(map(str.lower, note.get("may", MAY))),
-        set(map(str.lower, note.get("must", MUST))),
-        {
-            k.lower(): set(map(str.lower, v))
-                for k, v in note.get("limit", {}).items()
-        }
-    )
-
-def plural(n, s):
-    return s if n == 1 else s + "s"
-
-def time_components(dt: timedelta):
-    if x := dt.days//30:
-        yield f"{x} {plural(x, 'month')}"
-    if x := dt.days%30:
-        yield f"{x} {plural(x, 'day')}"
-    d, r = divmod(dt.seconds, 3600)
-    if x := d:
-        yield f"{x} {plural(x, 'hour')}"
-    if x := r // 60:
-        yield f"{x} {plural(x, 'minute')}"
-    if dt.seconds < 60:
-        yield f"{dt.seconds} {plural(dt.seconds, 'second')}"
-    yield "ago"
-
-def inow():
-    return int(datetime.now().timestamp())
-
-def tag_clauses(tag: Optional[str]):
-    if tag is None: return [], ()
-    if tag == "": return ["deleted_at IS NULL"], ()
-    
-    tags = set(map(str.strip, tag.split(",")))
-    
-    # Wildcard include-delete
-    if "?" in tags: return [], ()
-    
-    conds = []
-    params = []
-    
-    for tag in tags:
-        if tag == "!":
-            conds.append("deleted_at IS NOT NULL")
-        elif tag.endswith("!"):
-            conds.append("tag = ? AND deleted_at IS NOT NULL")
-            params.append(tag[:-1])
-        elif tag.endswith("?"):
-            conds.append("tag = ?")
-            params.append(tag[:-1])
-        else:
-            conds.append("tag = ? AND deleted_at IS NULL")
-            params.append(tag)
-    
-    return conds, tuple(params)
-
-def print_row(row: Optional[NoteRow], ago=False):
-    if row is None:
-        return print("No note found.")
-    if row.deleted_at:
-        print('\x1b[2m', end='')
-    dt = datetime.fromtimestamp(row.created_at)
-    data = [f"{row.id:4x}", dt, row.tag]
-    if row.note: data.append(row.note)
-    print(*data, sep='\t')
-    if ago:
-        print(' ', *time_components(datetime.now() - dt))
-    if row.deleted_at:
-        print('\x1b[0m', end='')
-
-@contextmanager
-def load_info(db_fn: Optional[str], config_fn: str):
-    with NoteData(get_config(db_fn, config_fn)) as data:
-        yield data
-
-def unpack[*A](args: Iterable[str], *defaults: *A) -> tuple[str, ...]|tuple[*A]:
-    return (*args, *defaults)[:len(defaults)] # type: ignore
-
-def expected(name: str):
-    raise CmdError(f"Expected a {name}.")
-
-def hexid(s) -> int:
-    try: return int(s, 16)
-    except ValueError:
-        raise CmdError(f"Invalid hex id {s!r}.")
-
-def warn(msg):
-    print(f"Warning: {msg}")
-
-def check_overflow(rest):
-    if rest: warn("Too many arguments.")
-
 class NoteData:
+    '''
+    A context manager for interacting with the note database.
+    '''
+    
     def __init__(self, config: Config):
         self.config = config
     
@@ -192,6 +93,33 @@ class NoteData:
         self.db.__exit__(*exc)
         del self.db
     
+    def tag_clauses(self, tag: Optional[str]):
+        if tag is None: return [], ()
+        if tag == "": return ["deleted_at IS NULL"], ()
+        
+        tags = set(map(str.strip, tag.split(",")))
+        
+        # Wildcard include-delete
+        if "?" in tags: return [], ()
+        
+        conds = []
+        params = []
+        
+        for tag in tags:
+            if tag == "!":
+                conds.append("deleted_at IS NOT NULL")
+            elif tag.endswith("!"):
+                conds.append("tag = ? AND deleted_at IS NOT NULL")
+                params.append(tag[:-1])
+            elif tag.endswith("?"):
+                conds.append("tag = ?")
+                params.append(tag[:-1])
+            else:
+                conds.append("tag = ? AND deleted_at IS NULL")
+                params.append(tag)
+        
+        return conds, tuple(params)
+    
     def query_note(self, query: str, *args):
         cur = self.db.execute(query, args)
         cur.row_factory = lambda c, r: NoteRow(*r)
@@ -203,13 +131,13 @@ class NoteData:
         return cur
     
     def count(self, tag: Optional[str]):
-        conds, params = tag_clauses(tag)
+        conds, params = self.tag_clauses(tag)
         where = f"WHERE {' OR '.join(conds)}" if conds else ""
         cur = self.db.execute(f"SELECT COUNT(*) FROM notes {where}", params)
         return cur.fetchone()[0]
     
     def most_recent(self, tag: str, limit: Optional[int]=1, note: Optional[str]=None) -> list[NoteRow]:
-        conds, params = tag_clauses(tag)
+        conds, params = self.tag_clauses(tag)
         where = f"WHERE ({' OR '.join(conds)})" if conds else ""
         if note is not None:
             where += " AND note LIKE ?"
@@ -335,6 +263,87 @@ class NoteData:
             base = None
         
         return base, delta
+
+## Utility functions ##
+
+def plural(n, s):
+    return s if n == 1 else s + "s"
+
+def inow():
+    return int(datetime.now().timestamp())
+
+@contextmanager
+def load_info(db_fn: Optional[str], config_fn: str):
+    with NoteData(get_config(db_fn, config_fn)) as data:
+        yield data
+
+def unpack[*A](args: Iterable[str], *defaults: *A) -> tuple[str, ...]|tuple[*A]:
+    return (*args, *defaults)[:len(defaults)] # type: ignore
+
+def expected(name: str):
+    raise CmdError(f"Expected a {name}.")
+
+def hexid(s) -> int:
+    try: return int(s, 16)
+    except ValueError:
+        raise CmdError(f"Invalid hex id {s!r}.")
+
+def warn(msg):
+    print(f"Warning: {msg}")
+
+def check_overflow(rest):
+    if rest: warn("Too many arguments.")
+
+def get_config(db_fn: Optional[str], fn: str) -> Config:
+    import tomllib
+    try:
+        with open(fn, 'rb') as f:
+            data: dict[str, Any] = tomllib.load(f)
+    except FileNotFoundError:
+        data = {}
+    
+    db = data.get("database", {})
+    note = data.get("note", {})
+    
+    return Config(
+        db.get("file", db_fn or DB_FILE),
+        db.get("note_table", DB_NOTE_TABLE),
+        db.get("edit_table", DB_EDIT_TABLE),
+        set(map(str.lower, note.get("may", MAY))),
+        set(map(str.lower, note.get("must", MUST))),
+        {
+            k.lower(): set(map(str.lower, v))
+                for k, v in note.get("limit", {}).items()
+        }
+    )
+
+def time_components(dt: timedelta):
+    if x := dt.days//30:
+        yield f"{x} {plural(x, 'month')}"
+    if x := dt.days%30:
+        yield f"{x} {plural(x, 'day')}"
+    d, r = divmod(dt.seconds, 3600)
+    if x := d:
+        yield f"{x} {plural(x, 'hour')}"
+    if x := r // 60:
+        yield f"{x} {plural(x, 'minute')}"
+    if dt.seconds < 60:
+        yield f"{dt.seconds} {plural(dt.seconds, 'second')}"
+    yield "ago"
+
+def print_row(row: Optional[NoteRow], ago=False):
+    if row is None:
+        return print("No note found.")
+    if row.deleted_at:
+        print('\x1b[2m', end='')
+    dt = datetime.fromtimestamp(row.created_at)
+    data = [f"{row.id:4x}", dt, row.tag]
+    if row.note: data.append(row.note)
+    print(*data, sep='\t')
+    if ago:
+        print(' ', *time_components(datetime.now() - dt))
+    if row.deleted_at:
+        print('\x1b[0m', end='')
 
 ## Subcommands ##
 
@@ -475,7 +484,7 @@ def usage(what: str=""):
             They are implicitly added together to form a final datetime.'''
     DOCS = {
         "": f'''
-            usage: note [-h [cmd]] [-d DB] cmd ...
+            usage: note [-h [cmd]] [-d DB] [-c CONFIG] cmd ...
             
             subcommands:
               add <tag> [note [dt]]  Add a note (implicit).
@@ -493,8 +502,9 @@ def usage(what: str=""):
             {TIME_INFO}
             
             options:
-              -h, --help [cmd]   Show this help message and exit
-              -d, --db DB        Database file
+              -h, --help [cmd]     Show this help message and exit
+              -d, --db DB          Database file
+              -c, --config CONFIG  Config file
         ''',
         "add": f'''
             usage: note add <tag> [note [dt]]
