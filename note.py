@@ -4,12 +4,13 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Callable, ContextManager, Iterable, Iterator, Optional, NamedTuple
 import re
+import os
 
 CONFIG = "~/.config/notelog.conf"
 
 ## Defaults if config file is missing ##
 
-DB_FILE = "~/.local/notelog.db"
+DB_FILE = "~/.local/share/notelog.db"
 DB_NOTE_TABLE = "notes"
 DB_EDIT_TABLE = "edits"
 
@@ -306,7 +307,7 @@ def get_config(db_fn: Optional[str], fn: str) -> Config:
     note = data.get("note", {})
     
     return Config(
-        db.get("file", db_fn or DB_FILE),
+        os.path.expanduser(db.get("file", db_fn or DB_FILE)),
         db.get("note_table", DB_NOTE_TABLE),
         db.get("edit_table", DB_EDIT_TABLE),
         set(map(str.lower, note.get("may", MAY))),
@@ -612,7 +613,6 @@ def main(*argv: str):
             case "edit": return subcmd_edit(info, *rest)
             case "delete": return subcmd_delete(info, *rest)
             case "sql":
-                import os
                 config = get_config(db_fn, config_fn)
                 return os.execvp("sqlite3", ["sqlite3", config.db_fn])
             

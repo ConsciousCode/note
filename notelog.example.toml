@@ -1,7 +1,7 @@
 # Copy to the default config location and edit to your liking
 
 [database]
-file = "~/.local/notes.db"
+file = "~/.local/share/notelog.db"
 note_table = "notes"
 edit_table = "edits"
 
