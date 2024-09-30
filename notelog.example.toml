@@ -2,8 +2,6 @@
 
 [database]
 file = "~/.local/share/notelog.db"
-note_table = "notes"
-edit_table = "edits"
 
 [note]
 # May have a note

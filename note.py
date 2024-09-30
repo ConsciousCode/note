@@ -44,12 +44,26 @@ RELTS_RE: Final = re.compile(rf'''
 ''', re.X)
 
 SCHEMA: Final = '''
-CREATE TABLE IF NOT EXISTS {notes} (
-    id INTEGER PRIMARY KEY,
-    created_at INTEGER,
+CREATE TABLE IF NOT EXISTS edits (
+    edit_id INTEGER PRIMARY KEY,
+    last_edit INTEGER,
+    noted_at INTEGER,
+    modified_at INTEGER NOT NULL, /* edit timestamp */
+    tag TEXT NOT NULL,
+    note TEXT,
+    
+    FOREIGN KEY(last_edit) REFERENCES edits(edit_id)
+);
+CREATE TABLE IF NOT EXISTS notes (
+    note_id INTEGER PRIMARY KEY,
+    last_edit INTEGER,
+    noted_at INTEGER NOT NULL,
+    created_at INTEGER, /* first created */
     deleted_at INTEGER,
     tag TEXT NOT NULL,
-    note TEXT
+    note TEXT,
+    
+    FOREIGN KEY(last_edit) REFERENCES edits(edit_id)
 );
 '''
 
@@ -60,18 +74,26 @@ class CmdError(RuntimeError):
 
 class Config(NamedTuple):
     db_fn: str
-    db_notes: str
-    db_edits: str
     may: set[str]
     must: set[str]
     limit: dict[str, set[str]]
 
-class NoteRow(NamedTuple):
-    id: int
-    created_at: int
-    deleted_at: int
+class EditRow(NamedTuple):
+    edit_id: int
+    last_edit: Optional[int]
+    noted_at: Optional[int]
+    modified_at: int
     tag: str
-    note: str
+    note: Optional[str]
+
+class NoteRow(NamedTuple):
+    note_id: int
+    last_edit: Optional[int]
+    noted_at: int
+    created_at: Optional[int]
+    deleted_at: Optional[int]
+    tag: str
+    note: Optional[str]
 
 class NoteData:
     '''
@@ -84,9 +106,7 @@ class NoteData:
     def __enter__(self):
         import sqlite3
         self.db = sqlite3.connect(self.config.db_fn).__enter__()
-        self.db.executescript(SCHEMA.format(
-            notes=self.config.db_notes
-        ))
+        self.db.executescript(SCHEMA)
         self.db.commit()
         return self
     
@@ -126,6 +146,11 @@ class NoteData:
         cur.row_factory = lambda c, r: NoteRow(*r)
         return cur
     
+    def query_edit(self, query: str, *args):
+        cur = self.db.execute(query, args)
+        cur.row_factory = lambda c, r: EditRow(*r)
+        return cur
+    
     def exec_commit(self, query: str, *args):
         cur = self.db.execute(query, args)
         self.db.commit()
@@ -145,18 +170,18 @@ class NoteData:
             params = (*params, note)
         lclause = limit and f"LIMIT {limit}" or ""
         return self.query_note(
-            f"SELECT * FROM notes {where} ORDER BY created_at DESC {lclause}",
+            f"SELECT * FROM notes {where} ORDER BY noted_at DESC {lclause}",
             *params
         ).fetchall()
     
     def by_id(self, id: Optional[int]) -> Optional[NoteRow]:
         return self.query_note(
-            'SELECT * FROM notes WHERE id = ?', id
+            'SELECT * FROM notes WHERE note_id = ?', id
         ).fetchone()
     
     def by_range(self, start: int, end: int) -> list[NoteRow]:
         return self.query_note(
-            "SELECT * FROM notes WHERE id BETWEEN ? AND ?",
+            "SELECT * FROM notes WHERE note_id BETWEEN ? AND ?",
             start, end
         ).fetchall()
     
@@ -175,12 +200,14 @@ class NoteData:
     after = around(lambda a, b: a + b)
     
     def insert(self, when: int, tag: str, note: Optional[str]) -> Optional[int]:
-        return self.exec_commit(
-            "INSERT INTO notes (created_at, tag, note) VALUES (?, ?, ?)",
-            when, tag, note
+        return self.exec_commit('''
+            INSERT INTO notes (noted_at, created_at, tag, note)
+                VALUES (?, ?, ?, ?)
+            ''', when, inow(), tag, note
         ).lastrowid
     
     def edit(self, id: int, tag: str, note: Optional[str], ts: Optional[int]) -> Optional[NoteRow]:
+        # Edits automatically undelete the note.
         assign = ["deleted_at = NULL"]
         params = []
         if tag:
@@ -195,15 +222,44 @@ class NoteData:
                 params.append(note)
         
         if ts is not None:
-            assign.append("created_at = ?")
+            print("Ts", ts)
+            assign.append("noted_at = ?")
             params.append(ts)
         
-        print(assign)
-        self.exec_commit(
-            f"UPDATE notes SET {', '.join(assign)} WHERE id = ?",
-            *params, id
-        )
+        self.db.execute("BEGIN")
+        self.db.execute('''
+            INSERT INTO edits
+                (last_edit, noted_at, modified_at, tag, note)
+                SELECT last_edit, noted_at, ? AS modified_at, tag, note
+                    FROM notes WHERE note_id = ?
+        ''', (inow(), id,))
+        self.db.execute(f'''
+            UPDATE notes SET
+                last_edit = last_insert_rowid(),
+                {', '.join(assign)}
+                WHERE note_id = ?
+        ''', (*params, id))
+        self.db.execute("COMMIT")
         return self.by_id(id)
+    
+    def get_edit(self, id: int) -> Optional[EditRow]:
+        return self.query_edit(
+            "SELECT * FROM edits WHERE edit_id = ?", id
+        ).fetchone()
+    
+    def edits_of(self, id: int) -> Iterable[EditRow]:
+        cur = self.by_id(id)
+        if cur is None:
+            return
+        
+        while last_edit := cur.last_edit:
+            cur = self.query_edit(
+                "SELECT * FROM edits WHERE edit_id = ?",
+                last_edit
+            ).fetchone()
+            if cur is None:
+                raise RuntimeError("Edit chain broken.")
+            yield cur
     
     # Design note: No way to remove more than one note at a time or by tag.
     #  This is to prevent accidental deletion of a large number of notes. If
@@ -214,12 +270,12 @@ class NoteData:
     
     def delete(self, id: int):
         return self.exec_commit(
-            "UPDATE notes SET deleted_at = ? WHERE id = ?", inow(), id
+            "UPDATE notes SET deleted_at = ? WHERE note_id = ?", inow(), id
         ).rowcount > 0
     
     def undelete(self, id: int):
         return self.exec_commit(
-            "UPDATE notes SET deleted_at = NULL WHERE id = ?", id
+            "UPDATE notes SET deleted_at = NULL WHERE note_id = ?", id
         ).rowcount > 0
 
     def parse_offset(self, cmd: Optional[str]):
@@ -309,8 +365,6 @@ def get_config(db_fn: Optional[str], fn: str) -> Config:
     
     return Config(
         os.path.expanduser(db.get("file", db_fn or DB_FILE)),
-        db.get("note_table", DB_NOTE_TABLE),
-        db.get("edit_table", DB_EDIT_TABLE),
         set(map(str.lower, note.get("may", MAY))),
         set(map(str.lower, note.get("must", MUST))),
         {
@@ -337,15 +391,22 @@ def print_row(row: Optional[NoteRow], ago=False):
     if row is None:
         return print("No note found.")
     if row.deleted_at:
-        print('\x1b[2m', end='')
-    dt = datetime.fromtimestamp(row.created_at)
-    data = [f"{row.id:4x}", dt, row.tag]
+        print('\033[2m', end='')
+    dt = datetime.fromtimestamp(row.noted_at)
+    data = [f"{row.note_id:4x}", dt, row.tag]
     if row.note: data.append(row.note)
+    if row.last_edit: data.append("(edited)")
     print(*data, sep='\t')
     if ago:
         print(' ', *time_components(datetime.now() - dt))
     if row.deleted_at:
-        print('\x1b[0m', end='')
+        print('\033[0m', end='')
+
+def print_edit(row: EditRow):
+    dt = datetime.fromtimestamp(row.modified_at)
+    data = [f"  \33[2m{row.edit_id:4x}", dt, row.tag]
+    if row.note: data.append(row.note)
+    print(*data, sep='\t')
 
 ## Subcommands ##
 
@@ -388,10 +449,16 @@ def subcmd_show(info: Info, *args: str):
         with info as data:
             for id in args[0].split(","):
                 if m := RANGE_RE.match(id):
-                    for row in data.by_range(hexid(m[1]), hexid(m[2])):
-                        print_row(row)
+                    rowit = data.by_range(hexid(m[1]), hexid(m[2]))
+                elif row := data.by_id(int(id, 16)):
+                    rowit = [row]
                 else:
-                    print_row(data.by_id(int(id, 16)))
+                    break
+                
+                for row in rowit:
+                    print_row(row)
+                    for edit in data.edits_of(row.note_id):
+                        print_edit(edit)
     except ValueError:
         raise CmdError("Invalid hex id.")
 
@@ -415,6 +482,9 @@ def subcmd_last(info: Info,
         if count == "-a":
             count = None
         else:
+            if count.endswith("!"):
+                count = count[:-1]
+                tag += "!"
             try:
                 count = int(count)
             except ValueError:
