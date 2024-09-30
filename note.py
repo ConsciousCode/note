@@ -2,48 +2,48 @@
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Any, Callable, ContextManager, Iterable, Iterator, Optional, NamedTuple
+from typing import Any, Callable, ContextManager, Final, Iterable, Iterator, Optional, NamedTuple
 import re
 import os
 
-CONFIG = "~/.config/notelog.conf"
+CONFIG: Final = "~/.config/notelog.conf"
 
 ## Defaults if config file is missing ##
 
-DB_FILE = "~/.local/share/notelog.db"
-DB_NOTE_TABLE = "notes"
-DB_EDIT_TABLE = "edits"
+DB_FILE: Final = "~/.local/share/notelog.db"
+DB_NOTE_TABLE: Final = "notes"
+DB_EDIT_TABLE: Final = "edits"
 
-MAY = {
+MAY: Final = {
     "water", "pee", "poop", "masturbate",
     "shower", "teeth", "nails", "shave",
     "sleep", "nap", "wake",
     "test"
 }
-MUST = {
+MUST: Final = {
     "begin", "fail", "complete",
     "note", "dream", "health",
     "food", "coffee"
 }
-LIMIT = {
+LIMIT: Final = {
     "coffee": {"begin", "complete"}
 }
 
 ## Regex ##
 
-UNITS = '(?:secs?|seconds?|mins?|minutes?|hrs?|hours?|[smh])'
-RANGE_RE = re.compile(r"([\da-f]+)-([\da-f]+)")
-DELTA_RE = re.compile(rf"([+-]?)\s*(\d+)\s*({UNITS})")
-TIME_RE = re.compile(
+UNITS: Final = '(?:secs?|seconds?|mins?|minutes?|hrs?|hours?|[smh])'
+RANGE_RE: Final = re.compile(r"([\da-f]+)-([\da-f]+)")
+DELTA_RE: Final = re.compile(rf"([+-]?)\s*(\d+)\s*({UNITS})")
+TIME_RE: Final = re.compile(
     r"([01]?\d|2[0-3]):([0-5]?\d)(?::([0-5]?\d))?\s*([ap]m)?"
 )
 # RELative TimeStamp
-RELTS_RE = re.compile(rf'''
+RELTS_RE: Final = re.compile(rf'''
     (?:((?:[+-]?\s*\d+\s*{UNITS})+)(?:\s+ago\b)?)?
     \s*(?:([<>]|before|after)?\s*\b(\S+))?
 ''', re.X)
 
-SCHEMA = '''
+SCHEMA: Final = '''
 CREATE TABLE IF NOT EXISTS {notes} (
     id INTEGER PRIMARY KEY,
     created_at INTEGER,
@@ -181,7 +181,7 @@ class NoteData:
         ).lastrowid
     
     def edit(self, id: int, tag: str, note: Optional[str], ts: Optional[int]) -> Optional[NoteRow]:
-        assign = ["deleted_at IS NULL"]
+        assign = ["deleted_at = NULL"]
         params = []
         if tag:
             assign.append("tag = ?")
@@ -189,7 +189,7 @@ class NoteData:
         
         if note is not None:
             if note == "":
-                assign.append("note IS NULL")
+                assign.append("note = NULL")
             else:
                 assign.append("note = ?")
                 params.append(note)
@@ -198,6 +198,7 @@ class NoteData:
             assign.append("created_at = ?")
             params.append(ts)
         
+        print(assign)
         self.exec_commit(
             f"UPDATE notes SET {', '.join(assign)} WHERE id = ?",
             *params, id
@@ -433,7 +434,7 @@ def subcmd_last(info: Info,
 def subcmd_edit(info: Info, *args: str):
     match args:
         case []: raise expected("hex id")
-        case [id, *rest]: check_overflow(rest)
+        case [id, *rest]: check_overflow(rest[3:])
         case _: raise NotImplementedError
     
     tag, note, time = unpack(rest, "", None, "")
