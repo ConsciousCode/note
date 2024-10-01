@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
-from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Any, Callable, ContextManager, Final, Iterable, Iterator, Optional, NamedTuple
+from typing import Any, Callable, Final, Iterable, Iterator, Optional, NamedTuple
 import re
 import os
+import sys
 
 CONFIG: Final = "~/.config/notelog.conf"
 
@@ -43,6 +43,7 @@ RELTS_RE: Final = re.compile(rf'''
     \s*(?:([<>]|before|after)?\s*\b(\S+))?
 ''', re.X)
 
+## Database schema ##
 SCHEMA: Final = '''
 CREATE TABLE IF NOT EXISTS edits (
     edit_id INTEGER PRIMARY KEY,
@@ -67,10 +68,54 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 '''
 
+## Utility functions ##
+
+def plural(n, s):
+    return s if n == 1 else s + "s"
+
+def inow():
+    return int(datetime.now().timestamp())
+
+def unpack[*A](args: Iterable[str], *defaults: *A) -> tuple[str, ...]|tuple[*A]:
+    return (*args, *defaults)[:len(defaults)] # type: ignore
+
+def expected(name: str):
+    raise CmdError(f"Expected a {name}.")
+
+def hexid(s) -> int:
+    try: return int(s, 16)
+    except ValueError:
+        raise CmdError(f"Invalid hex id {s!r}.")
+
+def warn(msg):
+    print(f"Warning: {msg}", file=sys.stderr)
+
+def check_overflow(rest):
+    if rest: warn("Too many arguments.")
+
+def time_components(dt: timedelta):
+    if x := dt.days//30:
+        yield f"{x} {plural(x, 'month')}"
+    if x := dt.days%30:
+        yield f"{x} {plural(x, 'day')}"
+    d, r = divmod(dt.seconds, 3600)
+    if x := d:
+        yield f"{x} {plural(x, 'hour')}"
+    if x := r // 60:
+        yield f"{x} {plural(x, 'minute')}"
+    if dt.seconds < 60:
+        yield f"{dt.seconds} {plural(dt.seconds, 'second')}"
+    yield "ago"
+
+def named_value(arg: str, it: Iterator[tuple[int, str]]):
+    try: return next(it)
+    except StopIteration:
+        raise expected(f"value after {arg}")
+
 ## Classes ##
 
 class CmdError(RuntimeError):
-    pass
+    '''Error for wrapping expected command errors, eg formatting.'''
 
 class Config(NamedTuple):
     db_fn: str
@@ -85,6 +130,12 @@ class EditRow(NamedTuple):
     modified_at: int
     tag: str
     note: Optional[str]
+    
+    def print(self):
+        dt = datetime.fromtimestamp(self.modified_at)
+        data = [f"  \33[2m{self.edit_id:4x}", dt, self.tag]
+        if self.note: data.append(self.note)
+        print(*data, sep='\t')
 
 class NoteRow(NamedTuple):
     note_id: int
@@ -94,6 +145,19 @@ class NoteRow(NamedTuple):
     deleted_at: Optional[int]
     tag: str
     note: Optional[str]
+    
+    def print(self, ago=False):
+        if self.deleted_at:
+            print('\033[2m', end='')
+        dt = datetime.fromtimestamp(self.noted_at)
+        data = [f"{self.note_id:4x}", dt, self.tag]
+        if self.note: data.append(self.note)
+        if self.last_edit: data.append("(edited)")
+        print(*data, sep='\t')
+        if ago:
+            print(' ', *time_components(datetime.now() - dt))
+        if self.deleted_at:
+            print('\033[m', end='')
 
 class NoteData:
     '''
@@ -174,7 +238,7 @@ class NoteData:
             *params
         ).fetchall()
     
-    def by_id(self, id: Optional[int]) -> Optional[NoteRow]:
+    def by_id(self, id: int) -> Optional[NoteRow]:
         return self.query_note(
             'SELECT * FROM notes WHERE note_id = ?', id
         ).fetchone()
@@ -199,12 +263,15 @@ class NoteData:
     before = around(lambda a, b: a - b)
     after = around(lambda a, b: a + b)
     
-    def insert(self, when: int, tag: str, note: Optional[str]) -> Optional[int]:
-        return self.exec_commit('''
+    def insert(self, when: int, tag: str, note: Optional[str]) -> int:
+        cur = self.exec_commit('''
             INSERT INTO notes (noted_at, created_at, tag, note)
                 VALUES (?, ?, ?, ?)
             ''', when, inow(), tag, note
         ).lastrowid
+        if cur is None:
+            raise RuntimeError("Failed to insert note.")
+        return cur
     
     def edit(self, id: int, tag: str, note: Optional[str], ts: Optional[int]) -> Optional[NoteRow]:
         # Edits automatically undelete the note.
@@ -222,7 +289,6 @@ class NoteData:
                 params.append(note)
         
         if ts is not None:
-            print("Ts", ts)
             assign.append("noted_at = ?")
             params.append(ts)
         
@@ -273,11 +339,6 @@ class NoteData:
             "UPDATE notes SET deleted_at = ? WHERE note_id = ?", inow(), id
         ).rowcount > 0
     
-    def undelete(self, id: int):
-        return self.exec_commit(
-            "UPDATE notes SET deleted_at = NULL WHERE note_id = ?", id
-        ).rowcount > 0
-
     def parse_offset(self, cmd: Optional[str]):
         if cmd is None:
             return None, 0
@@ -322,224 +383,6 @@ class NoteData:
         
         return base, delta
 
-## Utility functions ##
-
-def plural(n, s):
-    return s if n == 1 else s + "s"
-
-def inow():
-    return int(datetime.now().timestamp())
-
-@contextmanager
-def load_info(db_fn: Optional[str], config_fn: str):
-    with NoteData(get_config(db_fn, config_fn)) as data:
-        yield data
-
-def unpack[*A](args: Iterable[str], *defaults: *A) -> tuple[str, ...]|tuple[*A]:
-    return (*args, *defaults)[:len(defaults)] # type: ignore
-
-def expected(name: str):
-    raise CmdError(f"Expected a {name}.")
-
-def hexid(s) -> int:
-    try: return int(s, 16)
-    except ValueError:
-        raise CmdError(f"Invalid hex id {s!r}.")
-
-def warn(msg):
-    print(f"Warning: {msg}")
-
-def check_overflow(rest):
-    if rest: warn("Too many arguments.")
-
-def get_config(db_fn: Optional[str], fn: str) -> Config:
-    import tomllib
-    try:
-        with open(fn, 'rb') as f:
-            data: dict[str, Any] = tomllib.load(f)
-    except FileNotFoundError:
-        data = {}
-    
-    db = data.get("database", {})
-    note = data.get("note", {})
-    
-    return Config(
-        os.path.expanduser(db.get("file", db_fn or DB_FILE)),
-        set(map(str.lower, note.get("may", MAY))),
-        set(map(str.lower, note.get("must", MUST))),
-        {
-            k.lower(): set(map(str.lower, v))
-                for k, v in note.get("limit", {}).items()
-        }
-    )
-
-def time_components(dt: timedelta):
-    if x := dt.days//30:
-        yield f"{x} {plural(x, 'month')}"
-    if x := dt.days%30:
-        yield f"{x} {plural(x, 'day')}"
-    d, r = divmod(dt.seconds, 3600)
-    if x := d:
-        yield f"{x} {plural(x, 'hour')}"
-    if x := r // 60:
-        yield f"{x} {plural(x, 'minute')}"
-    if dt.seconds < 60:
-        yield f"{dt.seconds} {plural(dt.seconds, 'second')}"
-    yield "ago"
-
-def print_row(row: Optional[NoteRow], ago=False):
-    if row is None:
-        return print("No note found.")
-    if row.deleted_at:
-        print('\033[2m', end='')
-    dt = datetime.fromtimestamp(row.noted_at)
-    data = [f"{row.note_id:4x}", dt, row.tag]
-    if row.note: data.append(row.note)
-    if row.last_edit: data.append("(edited)")
-    print(*data, sep='\t')
-    if ago:
-        print(' ', *time_components(datetime.now() - dt))
-    if row.deleted_at:
-        print('\033[0m', end='')
-
-def print_edit(row: EditRow):
-    dt = datetime.fromtimestamp(row.modified_at)
-    data = [f"  \33[2m{row.edit_id:4x}", dt, row.tag]
-    if row.note: data.append(row.note)
-    print(*data, sep='\t')
-
-## Subcommands ##
-
-type Info = ContextManager[NoteData]
-
-def subcmd_add(info: Info, *args: str):
-    match args:
-        case []: raise expected("tag")
-        case [tag, *rest]: check_overflow(rest[2:])
-        case _: raise NotImplementedError
-    
-    tag = tag.lower()
-    note, dt = unpack(rest, None, None)
-    
-    if tag in MUST:
-        if note is None:
-            raise CmdError(f"Note {tag!r} requires a note.")
-    elif tag not in MAY:
-        raise CmdError(f"Unknown tag {tag!r}.")
-    
-    with info as data:
-        if tag in data.config.limit:
-            if note: note = note.lower()
-            if note not in data.config.limit[tag]:
-                raise CmdError(f"Tag {tag!r} note must be one of {data.config.limit[tag]}.")
-        
-        base, offset = data.parse_offset(dt)
-        if base is None:
-            base = int(datetime.now().timestamp())
-        
-        print_row(data.by_id(data.insert(base + offset, tag, note)))
-
-def subcmd_show(info: Info, *args: str):
-    match args:
-        case []: raise expected("hex id")
-        case [id, *rest]: check_overflow(rest)
-        case _: raise NotImplementedError
-    
-    try:
-        with info as data:
-            for id in args[0].split(","):
-                if m := RANGE_RE.match(id):
-                    rowit = data.by_range(hexid(m[1]), hexid(m[2]))
-                elif row := data.by_id(int(id, 16)):
-                    rowit = [row]
-                else:
-                    break
-                
-                for row in rowit:
-                    print_row(row)
-                    for edit in data.edits_of(row.note_id):
-                        print_edit(edit)
-    except ValueError:
-        raise CmdError("Invalid hex id.")
-
-def subcmd_count(info: Info, tag: Optional[str]=None, *rest):
-    check_overflow(rest)
-    with info as data:
-        print(data.count("" if tag == '-a' else tag))
-
-def subcmd_last(info: Info,
-        count: str|int|None=1,
-        tag: str="",
-        note: Optional[str]=None,
-        *rest
-    ):
-    check_overflow(rest)
-    if isinstance(count, str):
-        if count.endswith("?"):
-            count = count[:-1]
-            tag += "?"
-        
-        if count == "-a":
-            count = None
-        else:
-            if count.endswith("!"):
-                count = count[:-1]
-                tag += "!"
-            try:
-                count = int(count)
-            except ValueError:
-                if tag: note = tag
-                count, tag = 1, count
-            
-            if count <= 0:
-                raise CmdError("Count must be positive.")
-    
-    with info as data:
-        if rows := data.most_recent(tag, count, note):
-            for row in reversed(rows):
-                print_row(row, True)
-        else:
-            print(f"No notes for {tag!r}.")
-
-def subcmd_edit(info: Info, *args: str):
-    match args:
-        case []: raise expected("hex id")
-        case [id, *rest]: check_overflow(rest[3:])
-        case _: raise NotImplementedError
-    
-    tag, note, time = unpack(rest, "", None, "")
-    try:
-        ts = int(datetime.fromisoformat(time).timestamp()) if time else None
-    except ValueError:
-        raise CmdError(f"Invalid time {time!r}.")
-    
-    with info as data:
-        print_row(data.edit(hexid(id), tag.lower(), note, ts))
-
-def subcmd_delete(info: Info, *args: str):
-    match args:
-        case []: raise expected("hex id")
-        case [id, *rest]: check_overflow(rest)
-        case _: raise NotImplementedError
-    
-    with info as data:
-        if data.delete(hexid(id)):
-            print("Deleted note.")
-        else:
-            print_row(None)
-
-def subcmd_undelete(info: Info, *args: str):
-    match args:
-        case []: raise expected("hex id")
-        case [id, *rest]: check_overflow(rest)
-        case _: raise NotImplementedError
-    
-    with info as data:
-        if data.undelete(hexid(id)):
-            print("Undeleted note.")
-        else:
-            print_row(None)
-
 def usage(what: str=""):
     import inspect
     
@@ -559,28 +402,28 @@ def usage(what: str=""):
             usage: note [-h [cmd]] [-d DB] [-c CONFIG] cmd ...
             
             subcommands:
-              add <tag> [note [dt]]  Add a note (implicit).
+            add <tag> [note [dt]]  Add a note (implicit).
                 <tag> [note [dt]]
-              show <id>              Show a note by hex id.
-              count <tag>            Count the tags noted.
-              last <count> [tag]     Get last tagged notes.
-              tags                   List all tags.
-              edit <id> <note>       Edit a note by hex id.
-              delete <id>            Delete a note by hex id.
-              undelete <id>          Undelete a note by hex id.
-              sql                    Open a sqlite3 shell.
-              help [cmd]             Show this help message.
+            show <id>              Show a note by hex id.
+            count <tag>            Count the tags noted.
+            last <count> [tag]     Get last tagged notes.
+            tags                   List all tags.
+            edit <id> <note>       Edit a note by hex id.
+            delete <id>            Delete a note by hex id.
+            undelete <id>          Undelete a note by hex id.
+            sql                    Open a sqlite3 shell.
+            help [cmd]             Show this help message.
             {TAG_INFO}
             {TIME_INFO}
             
             options:
-              -h, --help [cmd]     Show this help message and exit
-              -d, --db DB          Database file
-              -c, --config CONFIG  Config file
+            -h, --help [cmd]     Show this help message and exit
+            -d, --db DB          Database file
+            -c, --config CONFIG  Config file
         ''',
         "add": f'''
             usage: note add <tag> [note [dt]]
-                   note <tag> [note [dt]]
+                note <tag> [note [dt]]
             
             Add a note to the database.
             {TAG_INFO}
@@ -602,7 +445,7 @@ def usage(what: str=""):
             usage: note tags
             
             Requires note: {', '.join(MUST)}
-            Note optional: {', '.join(MAY)}
+            Optional note: {', '.join(MAY)}
         ''',
         "last": f'''
             usage: note last <N> [tag]
@@ -639,68 +482,225 @@ def usage(what: str=""):
     doc = inspect.cleandoc(DOCS[""])
     return f"Unknown subcommand {what!r}\n\n{doc}."
 
-def named_value(arg: str, it: Iterator[tuple[int, str]]):
-    try: return next(it)
-    except StopIteration:
-        raise expected(f"value after {arg}")
+class NoteApp:
+    def __init__(self, *rest, help=None, config=None, db=None):
+        self.rest = rest
+        self.help = help
+        self.config = config or CONFIG
+        self.db = db or DB_FILE
+    
+    @classmethod
+    def argparse(cls, *argv: str):
+        try:
+            opts = {}
+            it = iter(enumerate(argv, 1))
+            while True:
+                i, arg = next(it)
+                match arg:
+                    case "-h"|"--help":
+                        try:
+                            i, h = next(it)
+                        except StopIteration:
+                            opts['help'] = ''
+                            break
+                        
+                        check_overflow(argv[i:])
+                        opts['help'] = h
+                        break
+                    
+                    case '-c'|'--config':
+                        i, opts['config'] = named_value(arg, it)
+                    
+                    case "-d"|"--db":
+                        i, opts['db'] = named_value(arg, it)
+                    
+                    case _:
+                        break
+            
+            return cls(arg, *(arg for _, arg in it), **opts)
+        except StopIteration:
+            return None
+    
+    def get_config(self):
+        import tomllib
+        try:
+            with open(self.config, 'rb') as f:
+                data: dict[str, Any] = tomllib.load(f)
+        except FileNotFoundError:
+            data = {}
+        
+        db = data.get("database", {})
+        note = data.get("note", {})
+        
+        return Config(
+            os.path.expanduser(db.get("file", self.db)),
+            set(map(str.lower, note.get("may", MAY))),
+            set(map(str.lower, note.get("must", MUST))),
+            {
+                k.lower(): set(map(str.lower, v))
+                    for k, v in note.get("limit", {}).items()
+            }
+        )
+    
+    def info(self):
+        return NoteData(self.get_config())
+    
+    def run(self):
+        if self.help is not None:
+            check_overflow(self.rest)
+            return print(usage(self.help))
+        
+        if not self.rest:
+            raise expected("subcommand")
+        
+        if subcmd := getattr(self, f"subcmd_{self.rest[0]}", None):
+            return subcmd(*self.rest[1:])
+        else:
+            return self.subcmd_add(*self.rest)
+    
+    def subcmd_add(self, *args: str):
+        match args:
+            case []: raise expected("tag")
+            case [tag, *rest]: check_overflow(rest[2:])
+            case _: raise NotImplementedError
+        
+        tag = tag.lower()
+        note, dt = unpack(rest, None, None)
+        
+        if tag in MUST:
+            if note is None:
+                raise CmdError(f"Note {tag!r} requires a note.")
+        elif tag not in MAY:
+            raise CmdError(f"Unknown tag {tag!r}.")
+        
+        with self.info() as data:
+            if tag in data.config.limit:
+                if note: note = note.lower()
+                if note not in data.config.limit[tag]:
+                    raise CmdError(f"Tag {tag!r} note must be one of {data.config.limit[tag]}.")
+            
+            base, offset = data.parse_offset(dt)
+            if base is None:
+                base = int(datetime.now().timestamp())
+            
+            if note := data.by_id(data.insert(base + offset, tag, note)):
+                note.print()
+            else:
+                warn("Failed to add note.")
+
+    def subcmd_show(self, *args: str):
+        match args:
+            case []: raise expected("hex id")
+            case [id, *rest]: check_overflow(rest)
+            case _: raise NotImplementedError
+        
+        with self.info() as data:
+            for id in args[0].split(","):
+                if m := RANGE_RE.match(id):
+                    rowit = data.by_range(hexid(m[1]), hexid(m[2]))
+                elif row := data.by_id(hexid(id)):
+                    rowit = [row]
+                else:
+                    break
+                
+                for row in rowit:
+                    row.print()
+                    for edit in data.edits_of(row.note_id):
+                        edit.print()
+
+    def subcmd_count(self, tag: Optional[str]=None, *rest):
+        check_overflow(rest)
+        with self.info() as data:
+            print(data.count("" if tag == '-a' else tag))
+    
+    def subcmd_tags(self, *rest: str):
+        return print(usage("tags"))
+
+    def subcmd_last(self,
+            count: str|int|None=1,
+            tag: str="",
+            note: Optional[str]=None,
+            *rest
+        ):
+        check_overflow(rest)
+        if isinstance(count, str):
+            if count.endswith("?"):
+                count = count[:-1]
+                tag += "?"
+            elif count.endswith("!"):
+                count = count[:-1]
+                tag += "!"
+            
+            if count == "-a":
+                count = None
+            else:
+                try:
+                    count = int(count)
+                except ValueError:
+                    if tag: note = tag
+                    count, tag = 1, count
+                
+                if count <= 0:
+                    raise CmdError("Count must be positive.")
+        
+        with self.info() as data:
+            if rows := data.most_recent(tag, count, note):
+                for row in reversed(rows):
+                    row.print(True)
+            else:
+                print("No notes found.")
+
+    def subcmd_edit(self, *args: str):
+        match args:
+            case []: raise expected("hex id")
+            case [id, *rest]: check_overflow(rest[3:])
+            case _: raise NotImplementedError
+        
+        tag, note, time = unpack(rest, "", None, "")
+        try:
+            ts = int(datetime.fromisoformat(time).timestamp()) if time else None
+        except ValueError:
+            raise CmdError(f"Invalid time {time!r}.")
+        
+        with self.info() as data:
+            if note := data.edit(hexid(id), tag.lower(), note, ts):
+                note.print()
+            else:
+                warn("No notes found.")
+
+    def subcmd_delete(self, *args: str):
+        match args:
+            case []: raise expected("hex id")
+            case [id, *rest]: check_overflow(rest)
+            case _: raise NotImplementedError
+        
+        with self.info() as data:
+            if data.delete(hexid(id)):
+                print("Deleted note.")
+            else:
+                print("No notes found.")
+    
+    def subcmd_sql(self, *rest: str):
+        config = self.get_config()
+        return os.execvp("sqlite3", ["sqlite3", config.db_fn, *rest])
+    
+    def subcmd_help(self, *rest: str):
+        check_overflow(rest)
+        return print(usage(*rest))
 
 def main(*argv: str):
-    opts = {}
-    it = iter(enumerate(argv, 1))
     try:
-        while True:
-            i, arg = next(it)
-            match arg:
-                case "-h"|"--help":
-                    try:
-                        i, h = next(it)
-                    except StopIteration:
-                        return print(usage())
-                    
-                    check_overflow(argv[i:])
-                    return print(usage(h))
-                
-                case '-c'|'--config':
-                    i, opts['config'] = named_value(arg, it)
-                
-                case "-d"|"--db":
-                    i, opts['db'] = named_value(arg, it)
-                
-                case _:
-                    break
-        
-        db_fn = opts.get("db")
-        config_fn = opts.get("config", CONFIG)
-        info = load_info(db_fn, config_fn)
-        rest = [arg for _, arg in it]
-        match arg:
-            case "show": return subcmd_show(info, *rest)
-            case "help":
-                check_overflow(rest[1:])
-                return print(usage(*rest[:1]))
-            case "count": return subcmd_count(info, *rest)
-            case "tags": return print(usage("tags"))
-            case "last": return subcmd_last(info, *rest)
-            case "edit": return subcmd_edit(info, *rest)
-            case "delete": return subcmd_delete(info, *rest)
-            case "sql":
-                config = get_config(db_fn, config_fn)
-                return os.execvp("sqlite3", ["sqlite3", config.db_fn])
-            
-            case "add": rest.pop(0)
-            case _: rest.insert(0, arg)
-        
-        return subcmd_add(info, *rest)
+        if app := NoteApp.argparse(*argv):
+            app.run()
+        else:
+            warn("Expected a command.")
+            print(usage())
     except BrokenPipeError:
         pass # head and tail close stdout
-    except StopIteration:
-        warn("Expected a command.")
-        print(usage())
     except KeyboardInterrupt:
         print()
     except CmdError as e:
         warn(e)
 
 if __name__ == "__main__":
-    import sys
     main(*sys.argv[1:])

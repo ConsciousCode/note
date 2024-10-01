@@ -3,6 +3,18 @@
 [database]
 file = "~/.local/share/notelog.db"
 
+[colors]
+enabled = true
+
+# ANSI colors for the CLI, use 0 or unset to disable
+default = 0
+timestamp = 0
+ago = 0
+tag = 0
+note = 0
+deleted = 2
+edits = 2
+
 [note]
 # May have a note
 may = [
