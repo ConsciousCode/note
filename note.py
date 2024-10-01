@@ -70,13 +70,11 @@ CREATE TABLE IF NOT EXISTS notes (
 
 ## Utility functions ##
 
-def plural(n, s):
-    return s if n == 1 else s + "s"
-
 def inow():
     return int(datetime.now().timestamp())
 
 def unpack[*A](args: Iterable[str], *defaults: *A) -> tuple[str, ...]|tuple[*A]:
+    '''Unpack rest arguments with defaults and proper typing.'''
     return (*args, *defaults)[:len(defaults)] # type: ignore
 
 def expected(name: str):
@@ -94,23 +92,23 @@ def check_overflow(rest):
     if rest: warn("Too many arguments.")
 
 def time_components(dt: timedelta):
+    '''Convert a timedelta to human-readable time components.'''
+    def plural(n, s):
+        b = f"{n} {s}"
+        return b if n == 1 else f"{b}s"
+    
     if x := dt.days//30:
-        yield f"{x} {plural(x, 'month')}"
+        yield plural(x, 'month')
     if x := dt.days%30:
-        yield f"{x} {plural(x, 'day')}"
+        yield plural(x, 'day')
     d, r = divmod(dt.seconds, 3600)
     if x := d:
-        yield f"{x} {plural(x, 'hour')}"
+        yield plural(x, 'hour')
     if x := r // 60:
-        yield f"{x} {plural(x, 'minute')}"
+        yield plural(x, 'minute')
     if dt.seconds < 60:
-        yield f"{dt.seconds} {plural(dt.seconds, 'second')}"
+        yield plural(dt.seconds, 'second')
     yield "ago"
-
-def named_value(arg: str, it: Iterator[tuple[int, str]]):
-    try: return next(it)
-    except StopIteration:
-        raise expected(f"value after {arg}")
 
 ## Classes ##
 
@@ -251,9 +249,12 @@ class NoteData:
     
     @staticmethod
     def around(op: Callable[[int, int], int]):
-        def around_fn(self, tag: str):
+        def around_fn(self, tag: str, ensure=False):
             match self.most_recent(tag, 2):
-                case []: return None
+                case []:
+                    if ensure:
+                        raise CmdError(f"No notes found for {tag!r}.")
+                    return None
                 case [a]: return op(a.created_at, 1)
                 case [a, b, *_]:
                     return op(a.created_at, (a.created_at - b.created_at)//2)
@@ -305,7 +306,7 @@ class NoteData:
                 {', '.join(assign)}
                 WHERE note_id = ?
         ''', (*params, id))
-        self.db.execute("COMMIT")
+        self.db.commit()
         return self.by_id(id)
     
     def get_edit(self, id: int) -> Optional[EditRow]:
@@ -335,49 +336,42 @@ class NoteData:
     #  redundant. The whole point was to pop the last note if I mistyped it.
     
     def delete(self, id: int):
-        return self.exec_commit(
+        self.exec_commit(
             "UPDATE notes SET deleted_at = ? WHERE note_id = ?", inow(), id
-        ).rowcount > 0
+        )
+        return self.by_id(id)
     
-    def parse_offset(self, cmd: Optional[str]):
+    def parse_offset(self, cmd: Optional[str]) -> tuple[Optional[int], int]:
         if cmd is None:
             return None, 0
         
-        ts = RELTS_RE.match(cmd.lower().strip())
-        if ts is None:
+        # dt [<> tag]
+        if not (ts := RELTS_RE.match(cmd.lower().strip())):
             raise CmdError(f"Invalid time string: {cmd!r}")
         
-        delta = sum(
+        delta = sum( # Add up time deltas
             int(s + x)*{"s": 1, "m": 60, "h": 60*60}[y[0]]
                 for s, x, y in DELTA_RE.findall(ts[1] or "")
         )
         
-        match ts[2]:
-            case "<"|"before":
-                base = self.before(ts[3])
-                delta = -delta
-            case ">"|"after": base = self.after(ts[3])
-            case None: delta = -delta
-            case _: raise NotImplementedError
-        
-        if base := ts[3]:
-            if dt := TIME_RE.match(base):
+        if sb := ts[3]:
+            if dt := TIME_RE.match(sb):
                 hour = int(dt[1])
-                base = datetime.now().replace(
-                    minute=int(dt[2]),
-                    second=int(dt[3] or 0)
-                )
+                base = datetime.now().replace(minute=int(dt[2]))
+                if sec := dt[3]:
+                    base = base.replace(second=int(sec))
                 ampm = dt[4]
-                if ampm is None:
-                    if base.hour > hour:
-                        base = base.replace(base.day - 1)
-                elif ampm == 'pm' and hour < 12:
+                if ampm == 'pm' and hour < 12:
                     hour += 12
                 base = int(base.replace(hour=hour).timestamp())
-            elif base in MUST or base in MAY:
-                base = self.before(base)
+            elif sb in MUST or sb in MAY:
+                match ts[2]:
+                    case ">"|"after": base = self.after(ts[3], ensure=True)
+                    case "<"|"before"|_:
+                        base = self.before(ts[3], ensure=True)
+                        delta = -delta
             else:
-                raise CmdError(f"Unknown tag {base!r}.")
+                raise CmdError(f"Unknown tag {sb!r}.")
         else:
             base = None
         
@@ -385,6 +379,8 @@ class NoteData:
 
 def usage(what: str=""):
     import inspect
+    
+    name = os.path.basename(sys.argv[0])
     
     TAG_INFO = '''
             A special suffix ! can be used to query only deleted notes.
@@ -399,7 +395,7 @@ def usage(what: str=""):
             They are implicitly added together to form a final datetime.'''
     DOCS = {
         "": f'''
-            usage: note [-h [cmd]] [-d DB] [-c CONFIG] cmd ...
+            usage: {name} [-h [cmd]] [-d DB] [-c CONFIG] cmd ...
             
             subcommands:
             add <tag> [note [dt]]  Add a note (implicit).
@@ -417,9 +413,9 @@ def usage(what: str=""):
             {TIME_INFO}
             
             options:
-            -h, --help [cmd]     Show this help message and exit
-            -d, --db DB          Database file
-            -c, --config CONFIG  Config file
+              -h, --help [cmd]     Show this help message and exit
+              -d, --db DB          Database file
+              -c, --config CONFIG  Config file
         ''',
         "add": f'''
             usage: note add <tag> [note [dt]]
@@ -491,6 +487,13 @@ class NoteApp:
     
     @classmethod
     def argparse(cls, *argv: str):
+        '''Build the app from command line arguments.'''
+        
+        def named_value(arg: str, it: Iterator[tuple[int, str]]):
+            try: return next(it)
+            except StopIteration:
+                raise expected(f"value after {arg}")
+        
         try:
             opts = {}
             it = iter(enumerate(argv, 1))
@@ -675,18 +678,19 @@ class NoteApp:
             case _: raise NotImplementedError
         
         with self.info() as data:
-            if data.delete(hexid(id)):
+            if note := data.delete(hexid(id)):
                 print("Deleted note.")
+                note.print()
             else:
-                print("No notes found.")
+                warn("No notes found.")
     
     def subcmd_sql(self, *rest: str):
         config = self.get_config()
         return os.execvp("sqlite3", ["sqlite3", config.db_fn, *rest])
     
     def subcmd_help(self, *rest: str):
-        check_overflow(rest)
-        return print(usage(*rest))
+        check_overflow(rest[1:])
+        return print(usage(*rest[:1]))
 
 def main(*argv: str):
     try:

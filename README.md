@@ -11,7 +11,7 @@ To change the default location of the config file, you can change `CONFIG` at th
 
 ## Help
 ```
-usage: note [-h [cmd]] [-d DB] [-c CONFIG] cmd ...
+usage: note [-h [cmd]] [-d DB] [-c CONFIG] subcmd ...
 
 subcommands:
   add <tag> [note [dt]]  Add a note (implicit).
