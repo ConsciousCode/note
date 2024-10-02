@@ -265,14 +265,14 @@ class NoteData:
     after = around(lambda a, b: a + b)
     
     def insert(self, when: int, tag: str, note: Optional[str]) -> int:
-        cur = self.exec_commit('''
+        id = self.exec_commit('''
             INSERT INTO notes (noted_at, created_at, tag, note)
                 VALUES (?, ?, ?, ?)
             ''', when, inow(), tag, note
         ).lastrowid
-        if cur is None:
+        if id is None:
             raise RuntimeError("Failed to insert note.")
-        return cur
+        return id
     
     def edit(self, id: int, tag: str, note: Optional[str], ts: Optional[int]) -> Optional[NoteRow]:
         # Edits automatically undelete the note.
