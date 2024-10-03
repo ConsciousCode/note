@@ -6,7 +6,7 @@ import re
 import os
 import sys
 
-CONFIG: Final = "~/.config/notelog.conf"
+CONFIG: Final = "~/.config/notelog.toml"
 
 ## Defaults if config file is missing ##
 
@@ -364,7 +364,7 @@ class NoteData:
                 if ampm == 'pm' and hour < 12:
                     hour += 12
                 base = int(base.replace(hour=hour).timestamp())
-            elif sb in MUST or sb in MAY:
+            elif sb in self.config.may or sb in self.config.must:
                 match ts[2]:
                     case ">"|"after": base = self.after(ts[3], ensure=True)
                     case "<"|"before"|_:
@@ -376,107 +376,6 @@ class NoteData:
             base = None
         
         return base, delta
-
-def usage(what: str=""):
-    import inspect
-    
-    name = os.path.basename(sys.argv[0])
-    
-    TAG_INFO = '''
-            A special suffix ! can be used to query only deleted notes.
-            Any tag can have a trailing ? to include deleted notes.
-            Multiple tags can be separated by commas.'''
-    TIME_INFO = '''
-            Time can be specified in a number of ways:
-            - [+-]N [sec/min/hour] ["ago"]  Time offset.
-            - [<>]|before|after <tag>       Relative to the last tag.
-            - HH:MM[:SS] [am/pm]            Explicit time.
-            
-            They are implicitly added together to form a final datetime.'''
-    DOCS = {
-        "": f'''
-            usage: {name} [-h [cmd]] [-d DB] [-c CONFIG] cmd ...
-            
-            subcommands:
-            add <tag> [note [dt]]  Add a note (implicit).
-                <tag> [note [dt]]
-            show <id>              Show a note by hex id.
-            count <tag>            Count the tags noted.
-            last <count> [tag]     Get last tagged notes.
-            tags                   List all tags.
-            edit <id> <note>       Edit a note by hex id.
-            delete <id>            Delete a note by hex id.
-            undelete <id>          Undelete a note by hex id.
-            sql                    Open a sqlite3 shell.
-            help [cmd]             Show this help message.
-            {TAG_INFO}
-            {TIME_INFO}
-            
-            options:
-              -h, --help [cmd]     Show this help message and exit
-              -d, --db DB          Database file
-              -c, --config CONFIG  Config file
-        ''',
-        "add": f'''
-            usage: note add <tag> [note [dt]]
-                note <tag> [note [dt]]
-            
-            Add a note to the database.
-            {TAG_INFO}
-            {TIME_INFO}
-        ''',
-        "show": '''
-            usage: note show <id>
-            
-            Show a note by its hex id. Also allows id to be a comma-separated
-            list of hex ids and ranges. Ex: note show 1,3,5-7
-        ''',
-        "count": f'''
-            usage: note count [tag]
-            
-            Count the number of notes with the given tag.
-            {TAG_INFO}
-        ''',
-        "tags": f'''
-            usage: note tags
-            
-            Requires note: {', '.join(MUST)}
-            Optional note: {', '.join(MAY)}
-        ''',
-        "last": f'''
-            usage: note last <N> [tag]
-                        
-            Get the last N notes with the given tag. If N ends with a ?,
-            implicitly include deleted notes.
-            {TAG_INFO}
-        ''',
-        "edit": '''
-            usage: note edit <id> [tag] [note] [time]
-            
-            Edit a note by its hex id. This does not check for tag validity,
-            and will automatically undeleted the note if it was deleted.
-        ''',
-        "delete": '''
-            usage: note delete <id>
-            
-            Delete a note by its hex id.
-        ''',
-        "sql": '''
-            usage: note sql
-            
-            Open an sqlite3 shell on the database.
-        ''',
-        "help": '''
-            usage: note help [cmd]
-            
-            Show the help message for a subcommand.
-        '''
-    }
-    
-    if doc := DOCS.get(what):
-        return inspect.cleandoc(doc)
-    doc = inspect.cleandoc(DOCS[""])
-    return f"Unknown subcommand {what!r}\n\n{doc}."
 
 class NoteApp:
     def __init__(self, *rest, help=None, config=None, db=None):
@@ -527,7 +426,7 @@ class NoteApp:
     def get_config(self):
         import tomllib
         try:
-            with open(self.config, 'rb') as f:
+            with open(os.path.expanduser(self.config), 'rb') as f:
                 data: dict[str, Any] = tomllib.load(f)
         except FileNotFoundError:
             data = {}
@@ -548,10 +447,114 @@ class NoteApp:
     def info(self):
         return NoteData(self.get_config())
     
+    def tag_info(self):
+        with self.info() as data:
+            return data.config.must, data.config.may
+    
+    def usage(self, what: str=""):
+        import inspect
+        
+        name = os.path.basename(sys.argv[0])
+        
+        TAG_INFO = '''
+                    A special suffix ! can be used to query only deleted notes. Any tag can have a trailing ? to include deleted notes. Multiple tags can be separated by commas.'''
+        TIME_INFO = '''
+                    Time can be specified in a number of ways:
+                    - [+-]N [sec/min/hour] ["ago"]  Time offset.
+                    - [<>]|before|after <tag>       Relative to the last tag.
+                    - HH:MM[:SS] [am/pm]            Explicit time.
+                    
+                    They are implicitly added together to form a final datetime.'''
+        
+        must, may = self.tag_info()
+        if what == "tags":
+            return f'''
+                usage: {name} tags
+                
+                Requires note: {', '.join(must)}
+                Optional note: {', '.join(may)}
+            '''
+        
+        DOCS = {
+            "": f'''
+                usage: {name} [-h [cmd]] [-d DB] [-c CONFIG] cmd ...
+                
+                subcommands:
+                add <tag> [note [dt]]  Add a note (implicit).
+                    <tag> [note [dt]]
+                show <id>              Show a note by hex id.
+                count <tag>            Count the tags noted.
+                last <count> [tag]     Get last tagged notes.
+                tags                   List all tags.
+                edit <id> <note>       Edit a note by hex id.
+                delete <id>            Delete a note by hex id.
+                undelete <id>          Undelete a note by hex id.
+                sql                    Open a sqlite3 shell.
+                help [cmd]             Show this help message.
+                {TAG_INFO}
+                {TIME_INFO}
+                
+                options:
+                    -h, --help [cmd]     Show this help message and exit
+                    -d, --db DB          Database file
+                    -c, --config CONFIG  Config file
+            ''',
+            "add": f'''
+                usage: note add <tag> [note [dt]]
+                    note <tag> [note [dt]]
+                
+                Add a note to the database.
+                {TAG_INFO}
+                {TIME_INFO}
+            ''',
+            "show": '''
+                usage: note show <id>
+                
+                Show a note by its hex id. Also allows id to be a comma-separated list of hex ids and ranges. Ex: note show 1,3,5-7
+            ''',
+            "count": f'''
+                usage: note count [tag]
+                
+                Count the number of notes with the given tag.
+                {TAG_INFO}
+            ''',
+            "last": f'''
+                usage: note last <N> [tag]
+                            
+                Get the last N notes with the given tag. If N ends with a ?, implicitly include deleted notes.
+                {TAG_INFO}
+            ''',
+            "edit": '''
+                usage: note edit <id> [tag] [note] [time]
+                
+                Edit a note by its hex id. This does not check for tag validity, and will automatically undeleted the note if it was deleted.
+            ''',
+            "delete": '''
+                usage: note delete <id>
+                
+                Delete a note by its hex id.
+            ''',
+            "sql": '''
+                usage: note sql
+                
+                Open an sqlite3 shell on the database.
+            ''',
+            "help": '''
+                usage: note help [cmd]
+                
+                Show the help message for a subcommand.
+            '''
+        }
+        
+        if doc := DOCS.get(what):
+            return inspect.cleandoc(doc)
+        doc = inspect.cleandoc(DOCS[""])
+        return f"Unknown subcommand {what!r}\n\n{doc}."
+    
     def run(self):
         if self.help is not None:
             check_overflow(self.rest)
-            return print(usage(self.help))
+            return print(self.usage(self.help))
         
         if not self.rest:
             raise expected("subcommand")
@@ -569,14 +572,13 @@ class NoteApp:
         
         tag = tag.lower()
         note, dt = unpack(rest, None, None)
-        
-        if tag in MUST:
-            if note is None:
-                raise CmdError(f"Note {tag!r} requires a note.")
-        elif tag not in MAY:
-            raise CmdError(f"Unknown tag {tag!r}.")
-        
         with self.info() as data:
+            if tag in data.config.must:
+                if note is None:
+                    raise CmdError(f"Note {tag!r} requires a note.")
+            elif tag not in data.config.may:
+                raise CmdError(f"Unknown tag {tag!r}.")
+            
             if tag in data.config.limit:
                 if note: note = note.lower()
                 if note not in data.config.limit[tag]:
@@ -617,7 +619,7 @@ class NoteApp:
             print(data.count("" if tag == '-a' else tag))
     
     def subcmd_tags(self, *rest: str):
-        return print(usage("tags"))
+        return print(self.usage("tags"))
 
     def subcmd_last(self,
             count: str|int|None=1,
@@ -690,7 +692,7 @@ class NoteApp:
     
     def subcmd_help(self, *rest: str):
         check_overflow(rest[1:])
-        return print(usage(*rest[:1]))
+        return print(self.usage(*rest[:1]))
 
 def main(*argv: str):
     try:
@@ -698,12 +700,13 @@ def main(*argv: str):
             app.run()
         else:
             warn("Expected a command.")
-            print(usage())
+            print(NoteApp().usage())
     except BrokenPipeError:
         pass # head and tail close stdout
     except KeyboardInterrupt:
         print()
     except CmdError as e:
+        raise
         warn(e)
 
 if __name__ == "__main__":
