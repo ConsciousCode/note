@@ -361,6 +361,13 @@ class NoteData:
                 if sec := dt[3]:
                     base = base.replace(second=int(sec))
                 ampm = dt[4]
+                # Adjust for 12-hour time
+                # implicit am/pm referring to periods in (12, 24)
+                # eg if it's 2pm and I say 3, that must be 3am.
+                # if it's 2pm and I say 1, that must be 1pm
+                if ampm == '' and base.hour > hour + 12:
+                    hour += 12
+                # explicit pm, implicit am
                 if ampm == 'pm' and hour < 12:
                     hour += 12
                 base = int(base.replace(hour=hour).timestamp())
@@ -469,8 +476,6 @@ class NoteApp:
         must, may = self.tag_info()
         if what == "tags":
             return f'''
-                usage: {name} tags
-                
                 Requires note: {', '.join(must)}
                 Optional note: {', '.join(may)}
             '''
