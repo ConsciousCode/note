@@ -542,7 +542,7 @@ class NoteApp:
             "sql": '''
                 usage: note sql
                 
-                Open an sqlite3 shell on the database.
+                Open an sqlite3 shell data.parse_offset(dt)on the database.
             ''',
             "help": '''
                 usage: note help [cmd]
@@ -588,6 +588,13 @@ class NoteApp:
                 if note: note = note.lower()
                 if note not in data.config.limit[tag]:
                     raise CmdError(f"Tag {tag!r} note must be one of {data.config.limit[tag]}.")
+            elif dt is None:
+                # If no time is given, check if the note is a relative time.
+                #  This only applies to may tags which can have note=None
+                if tag in data.config.may:
+                    if m := RELTS_RE.match(note or ""):
+                        if m[3] is None:
+                            note, dt = None, note
             
             base, offset = data.parse_offset(dt)
             if base is None:
