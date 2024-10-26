@@ -362,14 +362,21 @@ class NoteData:
                     base = base.replace(second=int(sec))
                 ampm = dt[4]
                 # Adjust for 12-hour time
-                # implicit am/pm referring to periods in (12, 24)
-                # eg if it's 2pm and I say 3, that must be 3am.
-                # if it's 2pm and I say 1, that must be 1pm
-                if ampm == '' and base.hour > hour + 12:
-                    hour += 12
+                # Examples for my sanity:
+                # - 2pm, given 3 -> 3am because 3pm hasn't happened yet
+                # - 2pm, given 1 -> 1pm
+                # - 3am, given 4 -> 4pm because 4am hasn't happened yet
+                if ampm == '':
+                    #if not (base.hour <= hour + 12 and hour <= base.hour):
+                    #if not (hour <= base.hour and base.hour <= hour + 12):
+                    if not (hour <= base.hour <= hour + 12):
+                        hour += 12
+                    if base.hour > hour + 12 or hour > base.hour:
+                        hour += 12
                 # explicit pm, implicit am
-                if ampm == 'pm' and hour < 12:
-                    hour += 12
+                elif ampm == 'pm':
+                    if hour < 12:
+                        hour += 12
                 base = int(base.replace(hour=hour).timestamp())
             elif sb in self.config.may or sb in self.config.must:
                 match ts[2]:
