@@ -725,8 +725,7 @@ def main(*argv: str):
     except KeyboardInterrupt:
         print()
     except CmdError as e:
-        raise
-        warn(e)
+        print("Error:", e, file=sys.stderr)
 
 if __name__ == "__main__":
     main(*sys.argv[1:])
