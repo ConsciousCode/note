@@ -30,6 +30,11 @@ must = [
     "food", "coffee"
 ]
 
+[note.default]
+# May notes which have a default value ("" if not specified)
+water = "32oz"
+pee = "clear"
+
 # Must have one of these notes
 [note.limit]
 coffee = ["begin", "complete"]

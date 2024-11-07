@@ -11,24 +11,22 @@ To change the default location of the config file, you can change `CONFIG` at th
 
 ## Help
 ```
-usage: note [-h [cmd]] [-d DB] [-c CONFIG] subcmd ...
+usage: note [-h [cmd]] [-d DB] [-c CONFIG] [-f] cmd ...
 
 subcommands:
-  add <tag> [note [dt]]  Add a note (implicit).
+add <tag> [note [dt]]  Add a note (implicit).
     <tag> [note [dt]]
-  show <id>              Show a note by hex id.
-  count <tag>            Count the tags noted.
-  last <count> [tag]     Get last tagged notes.
-  tags                   List all tags.
-  edit <id> <note>       Edit a note by hex id.
-  delete <id>            Delete a note by hex id.
-  undelete <id>          Undelete a note by hex id.
-  sql                    Open a sqlite3 shell.
-  help [cmd]             Show this help message.
+show <id>              Show a note by hex id.
+count <tag>            Count the tags noted.
+last <count> [tag]     Get last tagged notes.
+tags                   List all tags.
+edit <id> <note>       Edit a note by hex id.
+delete <id>            Delete a note by hex id.
+undelete <id>          Undelete a note by hex id.
+sql                    Open a sqlite3 shell.
+help [cmd]             Show this help message.
 
-A special suffix ! can be used to query only deleted notes.
-Any tag can have a trailing ? to include deleted notes.
-Multiple tags can be separated by commas.
+A special suffix ! can be used to query only deleted notes. Any tag can have a trailing ? to include deleted notes. Multiple tags can be separated by commas.
 
 Time can be specified in a number of ways:
 - [+-]N [sec/min/hour] ["ago"]  Time offset.
@@ -38,7 +36,8 @@ Time can be specified in a number of ways:
 They are implicitly added together to form a final datetime.
 
 options:
-  -h, --help [cmd]     Show this help message and exit
-  -d, --db DB          Database file
-  -c, --config CONFIG  Config file
+    -h, --help [cmd]     Show this help message and exit.
+    -d, --db DB          Database file.
+    -c, --config CONFIG  Config file.
+    -f, --force          Ignore note requirements.
 ```
