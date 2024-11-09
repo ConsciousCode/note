@@ -29,6 +29,8 @@ LIMIT: Final = {
     "coffee": {"begin", "complete"}
 }
 
+EDITOR: Final = os.environ.get("EDITOR", "nano")
+
 ## Regex ##
 
 UNITS: Final = '(?:secs?|seconds?|mins?|minutes?|hrs?|hours?|[smh])'
@@ -116,6 +118,8 @@ class CmdError(RuntimeError):
     '''Error for wrapping expected command errors, eg formatting.'''
 
 class Config(NamedTuple):
+    source: str
+    editor: str
     db_fn: str
     may: set[str]
     must: set[str]
@@ -445,15 +449,40 @@ class NoteApp:
     def get_config(self):
         import tomllib
         try:
-            with open(os.path.expanduser(self.config), 'rb') as f:
-                data: dict[str, Any] = tomllib.load(f)
+            with open(os.path.expanduser(self.config), 'r') as f:
+                source = f.read()
+                data: dict[str, Any] = tomllib.loads(source)
         except FileNotFoundError:
+            import inspect
+            import json
+            source = inspect.cleandoc(f'''
+                ## Generated from defaults ##
+                editor = {json.dumps(EDITOR)}
+                
+                [database]
+                file = {json.dumps(self.db)}
+                
+                [note]
+                # May have a note
+                may = {json.dumps(list(MAY))}
+                
+                # Must have a note
+                must = {json.dumps(list(MUST))}
+                
+                [note.default]
+                
+                # Must have one of these notes
+                [note.limit]
+                coffee = {json.dumps(list(LIMIT['coffee']))}
+            ''')
             data = {}
         
         db = data.get("database", {})
         note = data.get("note", {})
         
         return Config(
+            source,
+            data.get("editor", EDITOR),
             os.path.expanduser(db.get("file", self.db)),
             set(map(str.lower, note.get("may", MAY))),
             set(map(str.lower, note.get("must", MUST))),
@@ -478,6 +507,7 @@ class NoteApp:
         subcommands:
         add <tag> [note [dt]]  Add a note (implicit).
             <tag> [note [dt]]
+        config ["edit"]        Show or edit the configuration file.
         show <id>              Show a note by hex id.
         count <tag>            Count the tags noted.
         last <count> [tag]     Get last tagged notes.
@@ -594,7 +624,23 @@ class NoteApp:
                 note.print()
             else:
                 warn("Failed to add note.")
-
+    
+    def subcmd_config(self, what: str="", *_):
+        '''
+        ["edit"]
+        
+        Show the configuration file or edit it. Respects EDITOR env.
+        '''
+        
+        with self.info() as data:
+            if what == "edit":
+                editor = data.config.editor
+                return os.execvp(editor, [
+                    editor, os.path.expanduser(self.config)
+                ])
+            else:
+                print(data.config.source)
+    
     def subcmd_show(self, *args: str):
         '''
         <id>
