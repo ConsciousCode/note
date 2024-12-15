@@ -5,6 +5,7 @@ from typing import Any, Callable, Final, Iterable, Iterator, Optional, NamedTupl
 import re
 import os
 import sys
+import string
 
 CONFIG: Final = "~/.config/notelog.toml"
 
@@ -112,6 +113,10 @@ def time_components(dt: timedelta):
         yield plural(dt.seconds, 'second')
     yield "ago"
 
+def bash_quote(text: Optional[str]):
+    if text is None: return '""'
+    return f"'{text.replace("'", "'\\''")}'"
+
 ## Classes ##
 
 class CmdError(RuntimeError):
@@ -135,10 +140,12 @@ class EditRow(NamedTuple):
     note: Optional[str]
     
     def print(self):
-        dt = datetime.fromtimestamp(self.modified_at)
-        data = [f"  \33[2m{self.edit_id:4x}", dt, self.tag]
-        if self.note: data.append(self.note)
-        print(*data, sep='\t')
+        print(
+            f"  \33[2m{self.edit_id:4x}", self.tag,
+            bash_quote(self.note),
+            datetime.fromtimestamp(self.modified_at).isoformat(),
+            sep='\t'
+        )
 
 class NoteRow(NamedTuple):
     note_id: int
@@ -153,8 +160,7 @@ class NoteRow(NamedTuple):
         if self.deleted_at:
             print('\033[2m', end='')
         dt = datetime.fromtimestamp(self.noted_at)
-        data = [f"{self.note_id:4x}", dt, self.tag]
-        if self.note: data.append(self.note)
+        data = [f"{self.note_id:4x}", self.tag, bash_quote(self.note), dt.isoformat()]
         if self.last_edit: data.append("(edited)")
         print(*data, sep='\t')
         if ago:
@@ -365,15 +371,21 @@ class NoteData:
                 base = datetime.now().replace(minute=int(dt[2]))
                 if sec := dt[3]:
                     base = base.replace(second=int(sec))
-                ampm = dt[4]
                 # Adjust for 12-hour time
-                if ampm == '':
-                    if 12 <= base.hour >= hour + 12:
-                        hour += 12
-                # explicit pm, implicit am
-                elif ampm == 'pm':
-                    if hour < 12:
-                        hour += 12
+                match dt[4]:
+                    case 'am':
+                        if 12 <= base.hour >= hour + 12:
+                            hour += 12
+                    case 'pm':
+                        if hour < 12:
+                            hour += 12
+                    case _:
+                        now_hour = base.hour
+                        if now_hour >= 12:
+                            if hour < now_hour - 12:
+                                hour += 12
+                        elif hour < now_hour:
+                            hour += 12
                 base = int(base.replace(hour=hour).timestamp())
             elif sb in self.config.may or sb in self.config.must:
                 match ts[2]:
