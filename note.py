@@ -699,9 +699,8 @@ class NoteApp:
         '''
         check_overflow(rest)
         if isinstance(count, str):
-            if m := re.match(r"(?:(\d+)|(.+?))([?!]*)", count):
+            if m := re.match(r"(?:(\d+)|([^?!]+))([?!]*)", count):
                 num, st, ex = m.groups()
-                print(num, st, ex)
                 if num:
                     count = int(num)
                     if count <= 0:
