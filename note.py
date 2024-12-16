@@ -692,31 +692,31 @@ class NoteApp:
             *rest
         ):
         '''
-        <N> [tag]
+        [count] [tag [note]]
                     
         Get the last N notes with the given tag. If N ends with a ?, implicitly include deleted notes.
         {TAG_INFO}
         '''
         check_overflow(rest)
         if isinstance(count, str):
-            if count.endswith("?"):
-                count = count[:-1]
-                tag += "?"
-            elif count.endswith("!"):
-                count = count[:-1]
-                tag += "!"
-            
-            if count == "-a":
-                count = None
-            else:
-                try:
-                    count = int(count)
-                except ValueError:
-                    if tag: note = tag
-                    count, tag = 1, count
+            if m := re.match(r"(?:(\d+)|(.+?))([?!]*)", count):
+                num, st, ex = m.groups()
+                print(num, st, ex)
+                if num:
+                    count = int(num)
+                    if count <= 0:
+                        raise CmdError("Count must be positive.")
+                else:
+                    if st == '-a':
+                        count = None
+                    else:
+                        count = 1
+                        tag, note = st, tag or None
                 
-                if count <= 0:
-                    raise CmdError("Count must be positive.")
+                if "!" in ex: tag += "!"
+                elif "?" in ex: tag += "?"
+            else:
+                count = None
         
         with self.info() as data:
             if rows := data.most_recent(tag, count, note):
