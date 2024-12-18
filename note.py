@@ -114,7 +114,11 @@ def time_components(dt: timedelta):
     yield "ago"
 
 def bash_quote(text: Optional[str]):
-    if text is None: return '""'
+    if not text: return '""'
+    if not re.search(r'''[$!\\'"`\s]''', text):
+        return text
+    if not re.search(r'[$!\\"`]', text):
+        return f'"{text}"'
     return f"'{text.replace("'", "'\\''")}'"
 
 ## Classes ##
