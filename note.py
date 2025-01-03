@@ -109,13 +109,13 @@ def time_components(dt: timedelta):
         yield plural(x, 'hour')
     if x := r // 60:
         yield plural(x, 'minute')
-    if dt.seconds < 60:
+    if dt.seconds < 60: 
         yield plural(dt.seconds, 'second')
     yield "ago"
 
 def bash_quote(text: Optional[str]):
     if not text: return '""'
-    if not re.search(r'''[$!\\'"`\s]''', text):
+    if not re.search(r'''[$!\\'"`\s]''',text):
         return text
     if not re.search(r'[$!\\"`]', text):
         return f'"{text}"'
@@ -148,7 +148,8 @@ class EditRow(NamedTuple):
             f"  \33[2m{self.edit_id:4x}", self.tag,
             bash_quote(self.note),
             datetime.fromtimestamp(self.modified_at).isoformat(),
-            sep='\t'
+            sep='\t',
+            end='\33[m\n'
         )
 
 class NoteRow(NamedTuple):
@@ -360,6 +361,11 @@ class NoteData:
         if cmd is None:
             return None, 0
         
+        try:
+            return int(datetime.fromisoformat(cmd).timestamp()), 0
+        except ValueError:
+            pass
+        
         # dt [<> tag]
         if not (ts := RELTS_RE.match(cmd.lower().strip())):
             raise CmdError(f"Invalid time string: {cmd!r}")
@@ -398,7 +404,7 @@ class NoteData:
                         base = self.before(ts[3], ensure=True)
                         delta = -delta
             else:
-                raise CmdError(f"Unknown tag {sb!r}.")
+                raise CmdError(f"Unknown time {sb!r}.") from None
         else:
             base = None
         
