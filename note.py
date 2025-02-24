@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 
 from datetime import datetime, timedelta
-from typing import Any, Callable, Final, Iterable, Iterator, Optional, NamedTuple
+from typing import Any, Callable, Final, Iterable, Iterator, LiteralString, Optional, NamedTuple, cast
 import re
 import os
 import sys
-import string
+
+import psycopg as pg
+from psycopg.rows import class_row
 
 CONFIG: Final = "~/.config/notelog.toml"
 
 ## Defaults if config file is missing ##
 
-DB_FILE: Final = "~/.local/share/notelog.db"
+DB_DSN: Final = "postgresql://notelog"
 DB_NOTE_TABLE: Final = "notes"
 DB_EDIT_TABLE: Final = "edits"
 
@@ -51,8 +53,8 @@ SCHEMA: Final = '''
 CREATE TABLE IF NOT EXISTS edits (
     edit_id INTEGER PRIMARY KEY,
     last_edit INTEGER,
-    noted_at INTEGER,
-    modified_at INTEGER NOT NULL, /* edit timestamp */
+    noted_at TIMESTAMP,
+    modified_at TIMESTAMP NOT NULL, /* edit timestamp */
     tag TEXT NOT NULL,
     note TEXT,
     
@@ -61,9 +63,9 @@ CREATE TABLE IF NOT EXISTS edits (
 CREATE TABLE IF NOT EXISTS notes (
     note_id INTEGER PRIMARY KEY,
     last_edit INTEGER,
-    noted_at INTEGER NOT NULL,
-    created_at INTEGER, /* first created */
-    deleted_at INTEGER,
+    noted_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP, /* first created */
+    deleted_at TIMESTAMP,
     tag TEXT NOT NULL,
     note TEXT,
     
@@ -129,7 +131,7 @@ class CmdError(RuntimeError):
 class Config(NamedTuple):
     source: str
     editor: str
-    db_fn: str
+    dsn: str # Database source name
     may: set[str]
     must: set[str]
     default: dict[str, str]
@@ -155,7 +157,7 @@ class EditRow(NamedTuple):
 class NoteRow(NamedTuple):
     note_id: int
     last_edit: Optional[int]
-    noted_at: int
+    noted_at: datetime
     created_at: Optional[int]
     deleted_at: Optional[int]
     tag: str
@@ -164,7 +166,7 @@ class NoteRow(NamedTuple):
     def print(self, ago=False):
         if self.deleted_at:
             print('\033[2m', end='')
-        dt = datetime.fromtimestamp(self.noted_at)
+        dt = self.noted_at
         data = [f"{self.note_id:4x}", self.tag, bash_quote(self.note), dt.isoformat()]
         if self.last_edit: data.append("(edited)")
         print(*data, sep='\t')
@@ -182,9 +184,8 @@ class NoteData:
         self.config = config
     
     def __enter__(self):
-        import sqlite3
-        self.db = sqlite3.connect(self.config.db_fn).__enter__()
-        self.db.executescript(SCHEMA)
+        self.db = pg.connect(self.config.dsn).__enter__()
+        self.db.cursor().execute(SCHEMA)
         self.db.commit()
         return self
     
@@ -208,58 +209,65 @@ class NoteData:
             if tag == "!":
                 conds.append("deleted_at IS NOT NULL")
             elif tag.endswith("!"):
-                conds.append("tag = ? AND deleted_at IS NOT NULL")
+                conds.append("tag = %s AND deleted_at IS NOT NULL")
                 params.append(tag[:-1])
             elif tag.endswith("?"):
-                conds.append("tag = ?")
+                conds.append("tag = %s")
                 params.append(tag[:-1])
             else:
-                conds.append("tag = ? AND deleted_at IS NULL")
+                conds.append("tag = %s AND deleted_at IS NULL")
                 params.append(tag)
         
         return conds, tuple(params)
     
-    def query_note(self, query: str, *args):
-        cur = self.db.execute(query, args)
-        cur.row_factory = lambda c, r: NoteRow(*r)
+    def query[T](self, kind: type[T], query: LiteralString, *args):
+        cur = self.db.cursor(row_factory=class_row(kind))
+        cur.execute(query, args)
         return cur
+
+    def query_note(self, query: LiteralString, *args):
+        return self.query(NoteRow, query, *args)
     
-    def query_edit(self, query: str, *args):
-        cur = self.db.execute(query, args)
-        cur.row_factory = lambda c, r: EditRow(*r)
-        return cur
+    def query_edit(self, query: LiteralString, *args):
+        return self.query(EditRow, query, *args)
     
-    def exec_commit(self, query: str, *args):
-        cur = self.db.execute(query, args)
-        self.db.commit()
+    def execute(self, query: LiteralString, *args):
+        cur = self.db.cursor()
+        cur.execute(query, args)
         return cur
     
     def count(self, tag: Optional[str]):
         conds, params = self.tag_clauses(tag)
         where = f"WHERE {' OR '.join(conds)}" if conds else ""
-        cur = self.db.execute(f"SELECT COUNT(*) FROM notes {where}", params)
-        return cur.fetchone()[0]
+        cur = self.db.execute(
+            cast(LiteralString, f"SELECT COUNT(*) FROM notes {where}"), params
+        )
+        if (row := cur.fetchone()) is None:
+            raise RuntimeError("Failed to count notes.")
+        return row[0]
     
     def most_recent(self, tag: str, limit: Optional[int]=1, note: Optional[str]=None) -> list[NoteRow]:
         conds, params = self.tag_clauses(tag)
         where = f"WHERE ({' OR '.join(conds)})" if conds else ""
         if note is not None:
-            where += " AND note LIKE ?"
+            where += " AND note LIKE %s"
             params = (*params, note)
         lclause = limit and f"LIMIT {limit}" or ""
         return self.query_note(
-            f"SELECT * FROM notes {where} ORDER BY noted_at DESC {lclause}",
+            cast(LiteralString,
+                f"SELECT * FROM notes {where} ORDER BY noted_at DESC {lclause}"
+            ),
             *params
         ).fetchall()
     
     def by_id(self, id: int) -> Optional[NoteRow]:
         return self.query_note(
-            'SELECT * FROM notes WHERE note_id = ?', id
+            'SELECT * FROM notes WHERE note_id = %s', id
         ).fetchone()
     
     def by_range(self, start: int, end: int) -> list[NoteRow]:
         return self.query_note(
-            "SELECT * FROM notes WHERE note_id BETWEEN ? AND ?",
+            "SELECT * FROM notes WHERE note_id BETWEEN %s AND %s",
             start, end
         ).fetchall()
     
@@ -280,54 +288,55 @@ class NoteData:
     before = around(lambda a, b: a - b)
     after = around(lambda a, b: a + b)
     
-    def insert(self, when: int, tag: str, note: Optional[str]) -> int:
-        id = self.exec_commit('''
+    def insert(self, when: datetime, tag: str, note: Optional[str]) -> int:
+        cur = self.execute('''
             INSERT INTO notes (noted_at, created_at, tag, note)
-                VALUES (?, ?, ?, ?)
-            ''', when, inow(), tag, note
-        ).lastrowid
-        if id is None:
+                VALUES (%s, %s, %s, %s)
+                RETURNING note_id
+            ''', when, datetime.now(), tag, note
+        ).fetchone()
+        if cur is None:
             raise RuntimeError("Failed to insert note.")
-        return id
+        return cur[0]
     
-    def edit(self, id: int, tag: str, note: Optional[str], ts: Optional[int]) -> Optional[NoteRow]:
+    def edit(self, id: int, tag: str, note: Optional[str], ts: Optional[datetime]) -> Optional[NoteRow]:
         # Edits automatically undelete the note.
         assign = ["deleted_at = NULL"]
         params = []
         if tag:
-            assign.append("tag = ?")
+            assign.append("tag = %s")
             params.append(tag)
         
         if note is not None:
             if note == "":
                 assign.append("note = NULL")
             else:
-                assign.append("note = ?")
+                assign.append("note = %s")
                 params.append(note)
         
         if ts is not None:
-            assign.append("noted_at = ?")
+            assign.append("noted_at = %s")
             params.append(ts)
         
         self.db.execute("BEGIN")
         self.db.execute('''
             INSERT INTO edits
                 (last_edit, noted_at, modified_at, tag, note)
-                SELECT last_edit, noted_at, ? AS modified_at, tag, note
-                    FROM notes WHERE note_id = ?
-        ''', (inow(), id,))
-        self.db.execute(f'''
+                SELECT last_edit, noted_at, %s AS modified_at, tag, note
+                    FROM notes WHERE note_id = %s
+        ''', (inow(), id))
+        self.db.execute(cast(LiteralString, f'''
             UPDATE notes SET
                 last_edit = last_insert_rowid(),
                 {', '.join(assign)}
-                WHERE note_id = ?
-        ''', (*params, id))
+                WHERE note_id = %s
+        '''), (*params, id))
         self.db.commit()
         return self.by_id(id)
     
     def get_edit(self, id: int) -> Optional[EditRow]:
         return self.query_edit(
-            "SELECT * FROM edits WHERE edit_id = ?", id
+            "SELECT * FROM edits WHERE edit_id = %s", id
         ).fetchone()
     
     def edits_of(self, id: int) -> Iterable[EditRow]:
@@ -337,7 +346,7 @@ class NoteData:
         
         while last_edit := cur.last_edit:
             cur = self.query_edit(
-                "SELECT * FROM edits WHERE edit_id = ?",
+                "SELECT * FROM edits WHERE edit_id = %s",
                 last_edit
             ).fetchone()
             if cur is None:
@@ -352,17 +361,17 @@ class NoteData:
     #  redundant. The whole point was to pop the last note if I mistyped it.
     
     def delete(self, id: int):
-        self.exec_commit(
-            "UPDATE notes SET deleted_at = ? WHERE note_id = ?", inow(), id
-        )
-        return self.by_id(id)
+        return self.query_note("""
+            UPDATE notes SET deleted_at = %s WHERE note_id = %s
+            RETURNING *
+        """, datetime.now(), id).fetchone()
     
-    def parse_offset(self, cmd: Optional[str]) -> tuple[Optional[int], int]:
+    def parse_offset(self, cmd: Optional[str]) -> tuple[Optional[datetime], timedelta]:
         if cmd is None:
-            return None, 0
+            return None, timedelta(0)
         
         try:
-            return int(datetime.fromisoformat(cmd).timestamp()), 0
+            return datetime.fromisoformat(cmd), timedelta(0)
         except ValueError:
             pass
         
@@ -370,9 +379,13 @@ class NoteData:
         if not (ts := RELTS_RE.match(cmd.lower().strip())):
             raise CmdError(f"Invalid time string: {cmd!r}")
         
-        delta = sum( # Add up time deltas
-            int(s + x)*{"s": 1, "m": 60, "h": 60*60}[y[0]]
-                for s, x, y in DELTA_RE.findall(ts[1] or "")
+        delta = sum(( # Add up time deltas
+            int(s + x)*{
+                "s": timedelta(seconds=1),
+                "m": timedelta(minutes=1),
+                "h": timedelta(hours=1)
+            }[y[0]] for s, x, y in DELTA_RE.findall(ts[1] or "")),
+            timedelta()
         )
         
         if sb := ts[3]:
@@ -411,11 +424,11 @@ class NoteData:
         return base, delta
 
 class NoteApp:
-    def __init__(self, *rest, help=None, config=None, db=None, force=False):
+    def __init__(self, *rest, help=None, config=None, dsn=None, force=False):
         self.rest = rest
         self.help = help
         self.config = config or CONFIG
-        self.db = db or DB_FILE
+        self.dsn = dsn or DB_DSN
         self.force = force
     
     @classmethod
@@ -474,7 +487,7 @@ class NoteApp:
                 editor = {json.dumps(EDITOR)}
                 
                 [database]
-                file = {json.dumps(self.db)}
+                dsn = {json.dumps(self.dsn)}
                 
                 [note]
                 # May have a note
@@ -497,7 +510,7 @@ class NoteApp:
         return Config(
             source,
             data.get("editor", EDITOR),
-            os.path.expanduser(db.get("file", self.db)),
+            os.path.expanduser(db.get("dsn", self.dsn)),
             set(map(str.lower, note.get("may", MAY))),
             set(map(str.lower, note.get("must", MUST))),
             {k.lower(): v for k, v in note.get("default", {}).items()},
@@ -511,8 +524,9 @@ class NoteApp:
         return NoteData(self.get_config())
     
     def tag_info(self):
-        with self.info() as data:
-            return data.config.must, data.config.may
+        # Don't enter so we don't connect to the db
+        data = self.info()
+        return data.config.must, data.config.may
     
     def usage(self, what: str=""):
         '''
@@ -632,7 +646,7 @@ class NoteApp:
             
             base, offset = data.parse_offset(dt)
             if base is None:
-                base = int(datetime.now().timestamp())
+                base = datetime.now()
             
             if note := data.by_id(data.insert(base + offset, tag, note)):
                 note.print()
@@ -747,7 +761,7 @@ class NoteApp:
         
         tag, note, time = unpack(rest, "", None, "")
         try:
-            ts = int(datetime.fromisoformat(time).timestamp()) if time else None
+            ts = datetime.fromisoformat(time) if time else None
         except ValueError:
             raise CmdError(f"Invalid time {time!r}.")
         
@@ -782,7 +796,7 @@ class NoteApp:
         Open an sqlite3 shell on the database.
         '''
         config = self.get_config()
-        return os.execvp("sqlite3", ["sqlite3", config.db_fn, *rest])
+        return os.execvp("sqlite3", ["sqlite3", config.dsn, *rest])
     
     def subcmd_help(self, *rest: str):
         '''
