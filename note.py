@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
 from datetime import datetime, timedelta
-from typing import Any, Callable, Final, Iterable, Iterator, LiteralString, Optional, NamedTuple, cast
+from typing import Any, Callable, Final, Iterable, Iterator, LiteralString, NoReturn, Optional, NamedTuple, cast
 import re
 import os
 import sys
+import inspect
 
 import psycopg as pg
 from psycopg.rows import class_row
@@ -32,8 +33,6 @@ LIMIT: Final = {
     "coffee": {"begin", "complete"}
 }
 
-EDITOR: Final = os.environ.get("EDITOR", "nano")
-
 ## Regex ##
 
 UNITS: Final = '(?:secs?|seconds?|mins?|minutes?|hrs?|hours?|[smh])'
@@ -51,44 +50,37 @@ RELTS_RE: Final = re.compile(rf'''
 ## Database schema ##
 SCHEMA: Final = '''
 CREATE TABLE IF NOT EXISTS edits (
-    edit_id INTEGER PRIMARY KEY,
-    last_edit INTEGER,
+    edit_id SERIAL PRIMARY KEY,
+    last_edit INTEGER REFERENCES edits(edit_id),
     noted_at TIMESTAMP,
     modified_at TIMESTAMP NOT NULL, /* edit timestamp */
     tag TEXT NOT NULL,
-    note TEXT,
-    
-    FOREIGN KEY(last_edit) REFERENCES edits(edit_id)
+    note TEXT
 );
 CREATE TABLE IF NOT EXISTS notes (
-    note_id INTEGER PRIMARY KEY,
-    last_edit INTEGER,
+    note_id SERIAL PRIMARY KEY,
+    last_edit INTEGER REFERENCES edits(edit_id),
     noted_at TIMESTAMP NOT NULL,
     created_at TIMESTAMP, /* first created */
     deleted_at TIMESTAMP,
     tag TEXT NOT NULL,
-    note TEXT,
-    
-    FOREIGN KEY(last_edit) REFERENCES edits(edit_id)
+    note TEXT
 );
 '''
 
 ## Utility functions ##
 
-def inow():
-    return int(datetime.now().timestamp())
-
 def unpack[*A](args: Iterable[str], *defaults: *A) -> tuple[str, ...]|tuple[*A]:
     '''Unpack rest arguments with defaults and proper typing.'''
     return (*args, *defaults)[:len(defaults)] # type: ignore
 
-def expected(name: str):
+def expected(name: str) -> NoReturn:
     raise CmdError(f"Expected a {name}.")
 
 def hexid(s) -> int:
     try: return int(s, 16)
     except ValueError:
-        raise CmdError(f"Invalid hex id {s!r}.")
+        raise CmdError(f"Invalid hex id {s!r}.") from None
 
 def warn(msg):
     print(f"Warning: {msg}", file=sys.stderr)
@@ -130,7 +122,6 @@ class CmdError(RuntimeError):
 
 class Config(NamedTuple):
     source: str
-    editor: str
     dsn: str # Database source name
     may: set[str]
     must: set[str]
@@ -140,8 +131,8 @@ class Config(NamedTuple):
 class EditRow(NamedTuple):
     edit_id: int
     last_edit: Optional[int]
-    noted_at: Optional[int]
-    modified_at: int
+    noted_at: Optional[datetime]
+    modified_at: datetime
     tag: str
     note: Optional[str]
     
@@ -149,7 +140,7 @@ class EditRow(NamedTuple):
         print(
             f"  \33[2m{self.edit_id:4x}", self.tag,
             bash_quote(self.note),
-            datetime.fromtimestamp(self.modified_at).isoformat(),
+            self.modified_at.isoformat(),
             sep='\t',
             end='\33[m\n'
         )
@@ -158,15 +149,15 @@ class NoteRow(NamedTuple):
     note_id: int
     last_edit: Optional[int]
     noted_at: datetime
-    created_at: Optional[int]
-    deleted_at: Optional[int]
+    created_at: Optional[datetime]
+    deleted_at: Optional[datetime]
     tag: str
     note: Optional[str]
     
     def print(self, ago=False):
         if self.deleted_at:
             print('\033[2m', end='')
-        dt = self.noted_at
+        dt = self.noted_at.replace(microsecond=0)
         data = [f"{self.note_id:4x}", self.tag, bash_quote(self.note), dt.isoformat()]
         if self.last_edit: data.append("(edited)")
         print(*data, sep='\t')
@@ -272,16 +263,18 @@ class NoteData:
         ).fetchall()
     
     @staticmethod
-    def around(op: Callable[[int, int], int]):
-        def around_fn(self, tag: str, ensure=False):
+    def around(op: Callable[[datetime, timedelta], datetime]):
+        def around_fn(self: 'NoteData', tag: str, ensure=False):
             match self.most_recent(tag, 2):
                 case []:
                     if ensure:
                         raise CmdError(f"No notes found for {tag!r}.")
                     return None
-                case [a]: return op(a.created_at, 1)
+                case [a]: return op(a.created_at or a.noted_at, timedelta(seconds=1))
                 case [a, b, *_]:
-                    return op(a.created_at, (a.created_at - b.created_at)//2)
+                    aca = a.created_at or a.noted_at
+                    bca = b.created_at or b.noted_at
+                    return op(aca, (aca - bca)/2)
                 case _: raise NotImplementedError
         return around_fn
         
@@ -319,18 +312,21 @@ class NoteData:
             params.append(ts)
         
         self.db.execute("BEGIN")
-        self.db.execute('''
+        edit_id = self.db.execute('''
             INSERT INTO edits
                 (last_edit, noted_at, modified_at, tag, note)
                 SELECT last_edit, noted_at, %s AS modified_at, tag, note
                     FROM notes WHERE note_id = %s
-        ''', (inow(), id))
+            RETURNING edit_id
+        ''', (datetime.now(), id)).fetchone()
+        if edit_id is None:
+            raise RuntimeError("Failed to insert edit.")
         self.db.execute(cast(LiteralString, f'''
             UPDATE notes SET
-                last_edit = last_insert_rowid(),
+                last_edit = %s,
                 {', '.join(assign)}
                 WHERE note_id = %s
-        '''), (*params, id))
+        '''), (edit_id[0], *params, id))
         self.db.commit()
         return self.by_id(id)
     
@@ -387,6 +383,7 @@ class NoteData:
             }[y[0]] for s, x, y in DELTA_RE.findall(ts[1] or "")),
             timedelta()
         )
+        base: Optional[datetime]
         
         if sb := ts[3]:
             if dt := TIME_RE.match(sb):
@@ -395,21 +392,30 @@ class NoteData:
                 if sec := dt[3]:
                     base = base.replace(second=int(sec))
                 # Adjust for 12-hour time
-                match dt[4]:
-                    case 'am':
-                        if 12 <= base.hour >= hour + 12:
+                if hour <= 12:
+                    match dt[4]:
+                        case 'am': pass
+                        case 'pm':
                             hour += 12
-                    case 'pm':
-                        if hour < 12:
-                            hour += 12
-                    case _:
-                        now_hour = base.hour
-                        if now_hour >= 12:
-                            if hour < now_hour - 12:
-                                hour += 12
-                        elif hour < now_hour:
-                            hour += 12
-                base = int(base.replace(hour=hour).timestamp())
+                        
+                        # If > 12 we know it's 24 hour time, no adjustment needed.
+                        # Otherwise ambiguous 12-hour am/pm
+                        case _:
+                            candidates: list[datetime] = []
+                            am_time = base.replace(hour = hour%12)
+                            if am_time > base:
+                                am_time -= timedelta(days=1)
+                            candidates.append(am_time)
+
+                            if hour <= 12:
+                                pm_time = base.replace(hour = hour%12 + 12)
+                                if pm_time > base:
+                                    pm_time -= timedelta(days=1)
+                                candidates.append(pm_time)
+                            
+                            # Most recent time that was the hour
+                            hour = max(candidates).hour
+                base = base.replace(hour=hour)
             elif sb in self.config.may or sb in self.config.must:
                 match ts[2]:
                     case ">"|"after": base = self.after(ts[3], ensure=True)
@@ -435,33 +441,29 @@ class NoteApp:
     def argparse(cls, *argv: str):
         '''Build the app from command line arguments.'''
         
-        def named_value(arg: str, it: Iterator[tuple[int, str]]):
+        def named_value(arg: str, it: Iterator[str]):
             try: return next(it)
             except StopIteration:
-                raise expected(f"value after {arg}")
+                expected(f"value after {arg}")
         
         try:
             opts = {}
-            it = iter(enumerate(argv, 1))
+            it = iter(argv)
             while True:
-                i, arg = next(it)
+                arg = next(it)
                 match arg:
                     case "-h"|"--help":
                         try:
-                            i, h = next(it)
+                            opts['help'] = next(it)
                         except StopIteration:
                             opts['help'] = ''
-                            break
-                        
-                        check_overflow(argv[i:])
-                        opts['help'] = h
                         break
                     
                     case '-c'|'--config':
-                        i, opts['config'] = named_value(arg, it)
+                        opts['config'] = named_value(arg, it)
                     
                     case "-d"|"--db":
-                        i, opts['db'] = named_value(arg, it)
+                        opts['db'] = named_value(arg, it)
                     
                     case "-f"|"--force":
                         opts['force'] = True
@@ -469,7 +471,7 @@ class NoteApp:
                     case _:
                         break
             
-            return cls(arg, *(arg for _, arg in it), **opts)
+            return cls(arg, *it, **opts)
         except StopIteration:
             return None
     
@@ -480,12 +482,9 @@ class NoteApp:
                 source = f.read()
                 data: dict[str, Any] = tomllib.loads(source)
         except FileNotFoundError:
-            import inspect
             import json
             source = inspect.cleandoc(f'''
                 ## Generated from defaults ##
-                editor = {json.dumps(EDITOR)}
-                
                 [database]
                 dsn = {json.dumps(self.dsn)}
                 
@@ -509,7 +508,6 @@ class NoteApp:
         
         return Config(
             source,
-            data.get("editor", EDITOR),
             os.path.expanduser(db.get("dsn", self.dsn)),
             set(map(str.lower, note.get("may", MAY))),
             set(map(str.lower, note.get("must", MUST))),
@@ -533,31 +531,28 @@ class NoteApp:
         usage: {name} [-h [cmd]] [-d DB] [-c CONFIG] [-f] cmd ...
         
         subcommands:
-        add <tag> [note [dt]]  Add a note (implicit).
-            <tag> [note [dt]]
-        config ["edit"]        Show or edit the configuration file.
-        show <id>              Show a note by hex id.
-        count <tag>            Count the tags noted.
-        last <count> [tag]     Get last tagged notes.
-        tags                   List all tags.
-        edit <id> <note>       Edit a note by hex id.
-        delete <id>            Delete a note by hex id.
-        undelete <id>          Undelete a note by hex id.
-        sql                    Open a sqlite3 shell.
-        help [cmd]             Show this help message.
+        [add] <tag> [note [dt]]  Add a note (implicit).
+        config ["edit"]          Show or edit the configuration file.
+        show <id>                Show a note by hex id.
+        count <tag>              Count the tags noted.
+        last <count> [tag]       Get last tagged notes.
+        tags                     List all tags.
+        edit <id> <note>         Edit a note by hex id.
+        delete <id>              Delete a note by hex id.
+        undelete <id>            Undelete a note by hex id.
+        sql                      Open a sqlite3 shell.
+        help [cmd]               Show this help message.
         
         {TAG_INFO}
         
         {TIME_INFO}
         
         options:
-            -h, --help [cmd]     Show this help message and exit.
-            -d, --db DB          Database file.
-            -c, --config CONFIG  Config file.
-            -f, --force          Ignore note requirements.
+          -h, --help [cmd]       Show this help message and exit.
+          -d, --db DB            Database file.
+          -c, --config CONFIG    Config file.
+          -f, --force            Ignore note requirements.
         '''
-        
-        import inspect
         
         must, may = self.tag_info()
         if what == "tags":
@@ -592,11 +587,10 @@ class NoteApp:
     
     def run(self):
         if self.help is not None:
-            check_overflow(self.rest)
             return print(self.usage(self.help))
         
         if not self.rest:
-            raise expected("subcommand")
+            expected("subcommand")
         
         if subcmd := getattr(self, f"subcmd_{self.rest[0]}", None):
             return subcmd(*self.rest[1:])
@@ -605,8 +599,7 @@ class NoteApp:
     
     def subcmd_add(self, *args: str):
         '''
-        <tag> [note [dt]]
-            note <tag> [note [dt]]
+        ["note"] <tag> [note [dt]]
         
         Add a note to the database.
         
@@ -615,7 +608,7 @@ class NoteApp:
         {TIME_INFO}
         '''
         match args:
-            case []: raise expected("tag")
+            case []: expected("tag")
             case [tag, *rest]: check_overflow(rest[2:])
             case _: raise NotImplementedError
         
@@ -632,19 +625,23 @@ class NoteApp:
             elif not self.force:
                 raise CmdError(f"Unknown tag {tag!r}.")
             
+            base, offset = None, timedelta(0)
+
             if tag in data.config.limit:
                 if note: note = note.lower()
                 if note not in data.config.limit[tag] and not self.force:
                     raise CmdError(f"Tag {tag!r} note must be one of {data.config.limit[tag]}.")
             elif dt is None:
-                # If no time is given, check if the note is a relative time.
+                # If no time is given, check if the note is a time.
                 #  This only applies to may tags which can have note=None
-                if tag in data.config.may:
-                    if m := RELTS_RE.match(note or ""):
-                        if m[3] is None:
-                            note, dt = None, note
+                if tag in data.config.may or tag in data.config.default:
+                    try:
+                        base, offset = data.parse_offset(note)
+                    except:
+                        pass
+            else:
+                base, offset = data.parse_offset(dt)
             
-            base, offset = data.parse_offset(dt)
             if base is None:
                 base = datetime.now()
             
@@ -662,7 +659,7 @@ class NoteApp:
         
         with self.info() as data:
             if what == "edit":
-                editor = data.config.editor
+                editor = os.getenv("EDITOR", "nano")
                 return os.execvp(editor, [
                     editor, os.path.expanduser(self.config)
                 ])
@@ -676,7 +673,7 @@ class NoteApp:
         Show a note by its hex id. Also allows id to be a comma-separated list of hex ids and ranges. Ex: note show 1,3,5-7
         '''
         match args:
-            case []: raise expected("hex id")
+            case []: expected("hex id")
             case [id, *rest]: check_overflow(rest)
             case _: raise NotImplementedError
         
@@ -755,7 +752,7 @@ class NoteApp:
         Edit a note by its hex id. This does not check for tag validity, and will automatically undeleted the note if it was deleted.
         '''
         match args:
-            case []: raise expected("hex id")
+            case []: expected("hex id")
             case [id, *rest]: check_overflow(rest[3:])
             case _: raise NotImplementedError
         
@@ -763,7 +760,7 @@ class NoteApp:
         try:
             ts = datetime.fromisoformat(time) if time else None
         except ValueError:
-            raise CmdError(f"Invalid time {time!r}.")
+            raise CmdError(f"Invalid time {time!r}.") from None
         
         with self.info() as data:
             if note := data.edit(hexid(id), tag.lower(), note, ts):
@@ -778,7 +775,7 @@ class NoteApp:
         Delete a note by its hex id.
         '''
         match args:
-            case []: raise expected("hex id")
+            case []: expected("hex id")
             case [id, *rest]: check_overflow(rest)
             case _: raise NotImplementedError
         
@@ -791,12 +788,10 @@ class NoteApp:
     
     def subcmd_sql(self, *rest: str):
         '''
-         
-        
         Open an sqlite3 shell on the database.
         '''
         config = self.get_config()
-        return os.execvp("sqlite3", ["sqlite3", config.dsn, *rest])
+        return os.execvp("psql", ["psql", "-d", config.dsn, *rest])
     
     def subcmd_help(self, *rest: str):
         '''
