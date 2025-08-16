@@ -637,6 +637,7 @@ class NoteApp:
                 if tag in data.config.may or tag in data.config.default:
                     try:
                         base, offset = data.parse_offset(note)
+                        note = None
                     except:
                         pass
             else:
