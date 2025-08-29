@@ -634,10 +634,16 @@ class NoteApp:
             elif dt is None:
                 # If no time is given, check if the note is a time.
                 #  This only applies to may tags which can have note=None
-                if tag in data.config.may or tag in data.config.default:
+                if tag in data.config.may:
                     try:
                         base, offset = data.parse_offset(note)
                         note = None
+                    except:
+                        pass
+                elif tag in data.config.default:
+                    try:
+                        base, offset = data.parse_offset(note)
+                        note = data.config.default[tag]
                     except:
                         pass
             else:
