@@ -618,7 +618,7 @@ class NoteApp:
             if tag in data.config.must:
                 if note is None and not self.force:
                     raise CmdError(f"Note {tag!r} requires a note.")
-            elif tag in data.config.may:
+            elif tag in data.config.may or tag in data.config.default:
                 if note is None:
                     if (n := data.config.default.get(tag)) is not None:
                         note = str(n)
