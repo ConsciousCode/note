@@ -552,11 +552,11 @@ class NoteApp:
         )
     
     @contextmanager
-    def info(self):
+    def info(self, config: Config|None=None):
         with pg.connect(self.dsn) as db:
             _ = db.cursor().execute(SCHEMA)
             db.commit()
-            yield NoteDataConn(self.get_config(), db)
+            yield NoteDataConn(config or self.get_config(), db)
     
     def tag_info(self):
         config = self.get_config()
@@ -637,7 +637,7 @@ class NoteApp:
     
     def subcmd_add(self, *args: str):
         '''
-        ["note"] <tag> [note [dt]]
+        <tag> [note] [dt]
         
         Add a note to the database.
         
@@ -655,19 +655,23 @@ class NoteApp:
         
         tag = tag.lower()
         note, dt = unpack(rest, None, None)
-        with self.info() as data:
-            if tag in data.config.must:
-                if note is None and not self.force:
-                    raise CmdError(f"Note {tag!r} requires a note.")
-            elif tag in data.config.may or tag in data.config.default:
-                if note is None:
-                    if (n := data.config.default.get(tag)) is not None:
-                        note = str(n)
-            elif not self.force:
-                raise CmdError(f"Unknown tag {tag!r}.")
-            
-            base, offset = None, timedelta(0)
-
+        
+        # Defer connecting to database until necessary
+        config = self.get_config()
+        
+        if tag in config.must:
+            if note is None and not self.force:
+                raise CmdError(f"Note {tag!r} requires a note.")
+        elif tag in config.may or tag in config.default:
+            if note is None:
+                if (n := config.default.get(tag)) is not None:
+                    note = str(n)
+        elif not self.force:
+            raise CmdError(f"Unknown tag {tag!r}.")
+        
+        base, offset = None, timedelta(0)
+        
+        with self.info(config) as data:
             if tag in data.config.limit:
                 if note:
                     note = note.lower()
@@ -676,16 +680,10 @@ class NoteApp:
             elif dt is None:
                 # If no time is given, check if the note is a time.
                 #  This only applies to may tags which can have note=None
-                if tag in data.config.default:
+                if tag in data.config.may or tag in data.config.default:
                     try:
                         base, offset = data.parse_offset(note)
-                        note = data.config.default[tag]
-                    except Exception:
-                        pass
-                elif tag in data.config.may:
-                    try:
-                        base, offset = data.parse_offset(note)
-                        note = None
+                        note = data.config.default.get(tag)
                     except Exception:
                         pass
             else:
