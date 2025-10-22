@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Any, Callable, Final, Iterable, Iterator, LiteralString, NoReturn, Optional, NamedTuple, cast
+from typing import Callable, Final, LiteralString, NoReturn, NamedTuple, cast, final
+from collections.abc import Iterable, Iterator, Sequence
 import re
 import os
 import sys
 import inspect
+from typing_extensions import NotRequired, TypedDict
 
 import psycopg as pg
-from psycopg.rows import class_row
+from psycopg.rows import class_row, TupleRow
+
+type Param = int | str | bool | datetime | None
 
 CONFIG: Final = "~/.config/notelog.toml"
 
 ## Defaults if config file is missing ##
 
-DB_DSN: Final = "postgresql://notelog"
+DB_DSN: Final = "postgresql:///notelog"
 DB_NOTE_TABLE: Final = "notes"
 DB_EDIT_TABLE: Final = "edits"
 
@@ -72,25 +77,27 @@ CREATE TABLE IF NOT EXISTS notes (
 
 def unpack[*A](args: Iterable[str], *defaults: *A) -> tuple[str, ...]|tuple[*A]:
     '''Unpack rest arguments with defaults and proper typing.'''
-    return (*args, *defaults)[:len(defaults)] # type: ignore
+    return cast(tuple[str, ...]|tuple[*A], (*args, *defaults)[:len(defaults)])
 
 def expected(name: str) -> NoReturn:
     raise CmdError(f"Expected a {name}.")
 
-def hexid(s) -> int:
-    try: return int(s, 16)
+def hexid(s: str) -> int:
+    try:
+        return int(s, 16)
     except ValueError:
         raise CmdError(f"Invalid hex id {s!r}.") from None
 
-def warn(msg):
+def warn(msg: str):
     print(f"Warning: {msg}", file=sys.stderr)
 
-def check_overflow(rest):
-    if rest: warn("Too many arguments.")
+def check_overflow(rest: Sequence[str]):
+    if rest:
+        warn("Too many arguments.")
 
 def time_components(dt: timedelta):
     '''Convert a timedelta to human-readable time components.'''
-    def plural(n, s):
+    def plural(n: int, s: str):
         b = f"{n} {s}"
         return b if n == 1 else f"{b}s"
     
@@ -107,8 +114,9 @@ def time_components(dt: timedelta):
         yield plural(dt.seconds, 'second')
     yield "ago"
 
-def bash_quote(text: Optional[str]):
-    if not text: return '""'
+def bash_quote(text: str | None):
+    if not text:
+        return '""'
     if not re.search(r'''[$!\\'"`\s]''',text):
         return text
     if not re.search(r'[$!\\"`]', text):
@@ -120,6 +128,19 @@ def bash_quote(text: Optional[str]):
 class CmdError(RuntimeError):
     '''Error for wrapping expected command errors, eg formatting.'''
 
+class DatabaseSchema(TypedDict):
+    dsn: str
+
+class NoteSchema(TypedDict):
+    may: list[str]
+    must: list[str]
+    default: dict[str, str]
+    limit: dict[str, list[str]]
+
+class ConfigSchema(TypedDict):
+    database: DatabaseSchema
+    note: NoteSchema
+
 class Config(NamedTuple):
     source: str
     dsn: str # Database source name
@@ -130,11 +151,11 @@ class Config(NamedTuple):
 
 class EditRow(NamedTuple):
     edit_id: int
-    last_edit: Optional[int]
-    noted_at: Optional[datetime]
+    last_edit: int | None
+    noted_at: datetime | None
     modified_at: datetime
     tag: str
-    note: Optional[str]
+    note: str | None
     
     def print(self):
         print(
@@ -147,54 +168,53 @@ class EditRow(NamedTuple):
 
 class NoteRow(NamedTuple):
     note_id: int
-    last_edit: Optional[int]
+    last_edit: int | None
     noted_at: datetime
-    created_at: Optional[datetime]
-    deleted_at: Optional[datetime]
+    created_at: datetime | None
+    deleted_at: datetime | None
     tag: str
-    note: Optional[str]
+    note: str | None
     
-    def print(self, ago=False):
+    def print(self, ago: bool=False):
         if self.deleted_at:
             print('\033[2m', end='')
         dt = self.noted_at.replace(microsecond=0)
         data = [f"{self.note_id:4x}", self.tag, bash_quote(self.note), dt.isoformat()]
-        if self.last_edit: data.append("(edited)")
+        if self.last_edit:
+            data.append("(edited)")
         print(*data, sep='\t')
         if ago:
             print(' ', *time_components(datetime.now() - dt))
         if self.deleted_at:
             print('\033[m', end='')
 
-class NoteData:
+@final
+class NoteDataConn:
     '''
     A context manager for interacting with the note database.
     '''
     
-    def __init__(self, config: Config):
+    config: Config
+    db: pg.Connection[TupleRow]
+    
+    def __init__(self, config: Config, db: pg.Connection[TupleRow]):
         self.config = config
+        self.db = db
     
-    def __enter__(self):
-        self.db = pg.connect(self.config.dsn).__enter__()
-        self.db.cursor().execute(SCHEMA)
-        self.db.commit()
-        return self
-    
-    def __exit__(self, *exc):
-        self.db.__exit__(*exc)
-        del self.db
-    
-    def tag_clauses(self, tag: Optional[str]):
-        if tag is None: return [], ()
-        if tag == "": return ["deleted_at IS NULL"], ()
+    def tag_clauses(self, tag: str | None) -> tuple[list[str], tuple[str, ...]]:
+        if tag is None:
+            return [], ()
+        if tag == "":
+            return ["deleted_at IS NULL"], ()
         
         tags = set(map(str.strip, tag.split(",")))
         
         # Wildcard include-delete
-        if "?" in tags: return [], ()
+        if "?" in tags:
+            return [], ()
         
-        conds = []
-        params = []
+        conds = list[str]()
+        params = list[str]()
         
         for tag in tags:
             if tag == "!":
@@ -211,23 +231,22 @@ class NoteData:
         
         return conds, tuple(params)
     
-    def query[T](self, kind: type[T], query: LiteralString, *args):
+    def query[T](self, kind: type[T], query: LiteralString, *args: Param):
         cur = self.db.cursor(row_factory=class_row(kind))
-        cur.execute(query, args)
+        _ = cur.execute(query, args)
         return cur
 
-    def query_note(self, query: LiteralString, *args):
+    def query_note(self, query: LiteralString, *args: Param):
         return self.query(NoteRow, query, *args)
     
-    def query_edit(self, query: LiteralString, *args):
+    def query_edit(self, query: LiteralString, *args: Param):
         return self.query(EditRow, query, *args)
     
-    def execute(self, query: LiteralString, *args):
+    def execute(self, query: LiteralString, *args: Param):
         cur = self.db.cursor()
-        cur.execute(query, args)
-        return cur
+        return cur.execute(query, args)
     
-    def count(self, tag: Optional[str]):
+    def count(self, tag: str | None):
         conds, params = self.tag_clauses(tag)
         where = f"WHERE {' OR '.join(conds)}" if conds else ""
         cur = self.db.execute(
@@ -235,9 +254,9 @@ class NoteData:
         )
         if (row := cur.fetchone()) is None:
             raise RuntimeError("Failed to count notes.")
-        return row[0]
+        return cast(int, row[0])
     
-    def most_recent(self, tag: str, limit: Optional[int]=1, note: Optional[str]=None) -> list[NoteRow]:
+    def most_recent(self, tag: str, limit: int | None=1, note: str | None=None) -> list[NoteRow]:
         conds, params = self.tag_clauses(tag)
         where = f"WHERE ({' OR '.join(conds)})" if conds else ""
         if note is not None:
@@ -251,7 +270,7 @@ class NoteData:
             *params
         ).fetchall()
     
-    def by_id(self, id: int) -> Optional[NoteRow]:
+    def by_id(self, id: int) -> NoteRow | None:
         return self.query_note(
             'SELECT * FROM notes WHERE note_id = %s', id
         ).fetchone()
@@ -264,24 +283,26 @@ class NoteData:
     
     @staticmethod
     def around(op: Callable[[datetime, timedelta], datetime]):
-        def around_fn(self: 'NoteData', tag: str, ensure=False):
+        def around_fn(self: 'NoteDataConn', tag: str, ensure: bool=False):
             match self.most_recent(tag, 2):
                 case []:
                     if ensure:
                         raise CmdError(f"No notes found for {tag!r}.")
                     return None
-                case [a]: return op(a.created_at or a.noted_at, timedelta(seconds=1))
+                case [a]:
+                    return op(a.created_at or a.noted_at, timedelta(seconds=1))
                 case [a, b, *_]:
                     aca = a.created_at or a.noted_at
                     bca = b.created_at or b.noted_at
                     return op(aca, (aca - bca)/2)
-                case _: raise NotImplementedError
+                case _:
+                    raise NotImplementedError
         return around_fn
         
     before = around(lambda a, b: a - b)
     after = around(lambda a, b: a + b)
     
-    def insert(self, when: datetime, tag: str, note: Optional[str]) -> int:
+    def insert(self, when: datetime, tag: str, note: str | None):
         cur = self.execute('''
             INSERT INTO notes (noted_at, created_at, tag, note)
                 VALUES (%s, %s, %s, %s)
@@ -290,12 +311,12 @@ class NoteData:
         ).fetchone()
         if cur is None:
             raise RuntimeError("Failed to insert note.")
-        return cur[0]
+        return cast(int, cur[0])
     
-    def edit(self, id: int, tag: str, note: Optional[str], ts: Optional[datetime]) -> Optional[NoteRow]:
+    def edit(self, id: int, tag: str, note: str | None, ts: datetime | None) -> NoteRow | None:
         # Edits automatically undelete the note.
         assign = ["deleted_at = NULL"]
-        params = []
+        params = list[Param]()
         if tag:
             assign.append("tag = %s")
             params.append(tag)
@@ -311,7 +332,7 @@ class NoteData:
             assign.append("noted_at = %s")
             params.append(ts)
         
-        self.db.execute("BEGIN")
+        _ = self.db.execute("BEGIN")
         edit_id = self.db.execute('''
             INSERT INTO edits
                 (last_edit, noted_at, modified_at, tag, note)
@@ -321,7 +342,7 @@ class NoteData:
         ''', (datetime.now(), id)).fetchone()
         if edit_id is None:
             raise RuntimeError("Failed to insert edit.")
-        self.db.execute(cast(LiteralString, f'''
+        _ = self.db.execute(cast(LiteralString, f'''
             UPDATE notes SET
                 last_edit = %s,
                 {', '.join(assign)}
@@ -330,7 +351,7 @@ class NoteData:
         self.db.commit()
         return self.by_id(id)
     
-    def get_edit(self, id: int) -> Optional[EditRow]:
+    def get_edit(self, id: int) -> EditRow | None:
         return self.query_edit(
             "SELECT * FROM edits WHERE edit_id = %s", id
         ).fetchone()
@@ -362,7 +383,7 @@ class NoteData:
             RETURNING *
         """, datetime.now(), id).fetchone()
     
-    def parse_offset(self, cmd: Optional[str]) -> tuple[Optional[datetime], timedelta]:
+    def parse_offset(self, cmd: str | None) -> tuple[datetime | None, timedelta]:
         if cmd is None:
             return None, timedelta(0)
         
@@ -380,10 +401,13 @@ class NoteData:
                 "s": timedelta(seconds=1),
                 "m": timedelta(minutes=1),
                 "h": timedelta(hours=1)
-            }[y[0]] for s, x, y in DELTA_RE.findall(ts[1] or "")),
+            }[y[0]] for s, x, y in cast(
+                list[tuple[str, str, str]],
+                DELTA_RE.findall(ts[1] or ""))
+            ),
             timedelta()
         )
-        base: Optional[datetime]
+        base: datetime | None
         
         if sb := ts[3]:
             if dt := TIME_RE.match(sb):
@@ -394,7 +418,8 @@ class NoteData:
                 # Adjust for 12-hour time
                 if hour <= 12:
                     match dt[4]:
-                        case 'am': pass
+                        case 'am':
+                            pass
                         case 'pm':
                             hour += 12
                         
@@ -418,7 +443,8 @@ class NoteData:
                 base = base.replace(hour=hour)
             elif sb in self.config.may or sb in self.config.must:
                 match ts[2]:
-                    case ">"|"after": base = self.after(ts[3], ensure=True)
+                    case ">"|"after":
+                        base = self.after(ts[3], ensure=True)
                     case "<"|"before"|_:
                         base = self.before(ts[3], ensure=True)
                         delta = -delta
@@ -429,25 +455,32 @@ class NoteData:
         
         return base, delta
 
+class NoteAppArgs(TypedDict):
+    help: NotRequired[str|None]
+    config: NotRequired[str|None]
+    dsn: NotRequired[str|None]
+    force: NotRequired[bool]
+
 class NoteApp:
-    def __init__(self, *rest, help=None, config=None, dsn=None, force=False):
-        self.rest = rest
-        self.help = help
-        self.config = config or CONFIG
-        self.dsn = dsn or DB_DSN
-        self.force = force
+    def __init__(self, *rest: str, help: str|None=None, config: str|None=None, dsn: str|None=None, force: bool=False):
+        self.rest: tuple[str, ...] = rest
+        self.help: str|None = help
+        self.config: str = config or CONFIG
+        self.dsn: str = dsn or DB_DSN
+        self.force: bool = force
     
     @classmethod
     def argparse(cls, *argv: str):
         '''Build the app from command line arguments.'''
         
         def named_value(arg: str, it: Iterator[str]):
-            try: return next(it)
+            try:
+                return next(it)
             except StopIteration:
                 expected(f"value after {arg}")
         
         try:
-            opts = {}
+            opts: NoteAppArgs = {}
             it = iter(argv)
             while True:
                 arg = next(it)
@@ -463,7 +496,7 @@ class NoteApp:
                         opts['config'] = named_value(arg, it)
                     
                     case "-d"|"--db":
-                        opts['db'] = named_value(arg, it)
+                        opts['dsn'] = named_value(arg, it)
                     
                     case "-f"|"--force":
                         opts['force'] = True
@@ -480,7 +513,7 @@ class NoteApp:
         try:
             with open(os.path.expanduser(self.config), 'r') as f:
                 source = f.read()
-                data: dict[str, Any] = tomllib.loads(source)
+                data = tomllib.loads(source)
         except FileNotFoundError:
             import json
             source = inspect.cleandoc(f'''
@@ -503,8 +536,8 @@ class NoteApp:
             ''')
             data = {}
         
-        db = data.get("database", {})
-        note = data.get("note", {})
+        db = cast(DatabaseSchema, data.get("database", {}))
+        note = cast(NoteSchema, data.get("note", {}))
         
         return Config(
             source,
@@ -518,13 +551,16 @@ class NoteApp:
             }
         )
     
+    @contextmanager
     def info(self):
-        return NoteData(self.get_config())
+        with pg.connect(self.dsn) as db:
+            _ = db.cursor().execute(SCHEMA)
+            db.commit()
+            yield NoteDataConn(self.get_config(), db)
     
     def tag_info(self):
-        # Don't enter so we don't connect to the db
-        data = self.info()
-        return data.config.must, data.config.may
+        config = self.get_config()
+        return config.must, config.may
     
     def usage(self, what: str=""):
         '''
@@ -564,7 +600,9 @@ class NoteApp:
         if what == "":
             doc = inspect.cleandoc(self.usage.__doc__ or "")
         elif sub := getattr(self, f"subcmd_{what}", None):
-            doc = inspect.cleandoc(sub.__doc__ or "")
+            doc = inspect.cleandoc(
+                cast(Callable[[str], int|None], sub).__doc__ or ""
+            )
             doc = "usage: {name} " + f"{what} {doc}"
         else:
             doc = inspect.cleandoc(self.usage.__doc__ or "")
@@ -593,7 +631,7 @@ class NoteApp:
             expected("subcommand")
         
         if subcmd := getattr(self, f"subcmd_{self.rest[0]}", None):
-            return subcmd(*self.rest[1:])
+            return cast(int|None, subcmd(*self.rest[1:]))
         else:
             return self.subcmd_add(*self.rest)
     
@@ -608,9 +646,12 @@ class NoteApp:
         {TIME_INFO}
         '''
         match args:
-            case []: expected("tag")
-            case [tag, *rest]: check_overflow(rest[2:])
-            case _: raise NotImplementedError
+            case []:
+                expected("tag")
+            case [tag, *rest]:
+                check_overflow(rest[2:])
+            case _:
+                raise NotImplementedError
         
         tag = tag.lower()
         note, dt = unpack(rest, None, None)
@@ -628,7 +669,8 @@ class NoteApp:
             base, offset = None, timedelta(0)
 
             if tag in data.config.limit:
-                if note: note = note.lower()
+                if note:
+                    note = note.lower()
                 if note not in data.config.limit[tag] and not self.force:
                     raise CmdError(f"Tag {tag!r} note must be one of {data.config.limit[tag]}.")
             elif dt is None:
@@ -638,13 +680,13 @@ class NoteApp:
                     try:
                         base, offset = data.parse_offset(note)
                         note = data.config.default[tag]
-                    except:
+                    except Exception:
                         pass
                 elif tag in data.config.may:
                     try:
                         base, offset = data.parse_offset(note)
                         note = None
-                    except:
+                    except Exception:
                         pass
             else:
                 base, offset = data.parse_offset(dt)
@@ -664,14 +706,14 @@ class NoteApp:
         Show the configuration file or edit it. Respects EDITOR env.
         '''
         
-        with self.info() as data:
-            if what == "edit":
-                editor = os.getenv("EDITOR", "nano")
-                return os.execvp(editor, [
-                    editor, os.path.expanduser(self.config)
-                ])
-            else:
-                print(data.config.source)
+        config = self.get_config()
+        if what == "edit":
+            editor = os.getenv("EDITOR", "nano")
+            return os.execvp(editor, [
+                editor, os.path.expanduser(self.config)
+            ])
+        else:
+            print(config.source)
     
     def subcmd_show(self, *args: str):
         '''
@@ -680,9 +722,12 @@ class NoteApp:
         Show a note by its hex id. Also allows id to be a comma-separated list of hex ids and ranges. Ex: note show 1,3,5-7
         '''
         match args:
-            case []: expected("hex id")
-            case [id, *rest]: check_overflow(rest)
-            case _: raise NotImplementedError
+            case []:
+                expected("hex id")
+            case [id, *rest]:
+                check_overflow(rest)
+            case _:
+                raise NotImplementedError
         
         with self.info() as data:
             for id in args[0].split(","):
@@ -698,7 +743,7 @@ class NoteApp:
                     for edit in data.edits_of(row.note_id):
                         edit.print()
 
-    def subcmd_count(self, tag: Optional[str]=None, *rest):
+    def subcmd_count(self, tag: str | None=None, *rest: str):
         '''
         [tag]
         
@@ -710,14 +755,14 @@ class NoteApp:
         with self.info() as data:
             print(data.count("" if tag == '-a' else tag))
     
-    def subcmd_tags(self, *rest: str):
+    def subcmd_tags(self, *_: str):
         return print(self.usage("tags"))
 
     def subcmd_last(self,
             count: str|int|None=1,
             tag: str="",
-            note: Optional[str]=None,
-            *rest
+            note: str | None=None,
+            *rest: str
         ):
         '''
         [count] [tag [note]]
@@ -740,8 +785,10 @@ class NoteApp:
                         count = 1
                         tag, note = st, tag or None
                 
-                if "!" in ex: tag += "!"
-                elif "?" in ex: tag += "?"
+                if "!" in ex:
+                    tag += "!"
+                elif "?" in ex:
+                    tag += "?"
             else:
                 count = None
         
@@ -759,9 +806,12 @@ class NoteApp:
         Edit a note by its hex id. This does not check for tag validity, and will automatically undeleted the note if it was deleted.
         '''
         match args:
-            case []: expected("hex id")
-            case [id, *rest]: check_overflow(rest[3:])
-            case _: raise NotImplementedError
+            case []:
+                expected("hex id")
+            case [id, *rest]:
+                check_overflow(rest[3:])
+            case _:
+                raise NotImplementedError
         
         tag, note, time = unpack(rest, "", None, "")
         try:
@@ -782,9 +832,12 @@ class NoteApp:
         Delete a note by its hex id.
         '''
         match args:
-            case []: expected("hex id")
-            case [id, *rest]: check_overflow(rest)
-            case _: raise NotImplementedError
+            case []:
+                expected("hex id")
+            case [id, *rest]:
+                check_overflow(rest)
+            case _:
+                raise NotImplementedError
         
         with self.info() as data:
             if note := data.delete(hexid(id)):
@@ -812,7 +865,7 @@ class NoteApp:
 def main(*argv: str):
     try:
         if app := NoteApp.argparse(*argv):
-            app.run()
+            return app.run()
         else:
             warn("Expected a command.")
             print(NoteApp().usage())
@@ -824,4 +877,4 @@ def main(*argv: str):
         print("Error:", e, file=sys.stderr)
 
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    exit(main(*sys.argv[1:]))
