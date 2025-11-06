@@ -677,7 +677,8 @@ class NoteApp:
                     note = note.lower()
                 if note not in data.config.limit[tag] and not self.force:
                     raise CmdError(f"Tag {tag!r} note must be one of {data.config.limit[tag]}.")
-            elif dt is None:
+            
+            if dt is None:
                 # If no time is given, check if the note is a time.
                 #  This only applies to may tags which can have note=None
                 if tag in data.config.may or tag in data.config.default:
@@ -801,17 +802,21 @@ class NoteApp:
         '''
         <id> [tag] [note] [time]
         
-        Edit a note by its hex id. This does not check for tag validity, and will automatically undeleted the note if it was deleted.
+        Edit a note. If a hex id is provided, edit that particular note.
+        Otherwise, this searches for the last note with that tag within the
+        last hour. This does not check for tag validity, and will automatically undelete the note if it was deleted.
         '''
         match args:
             case []:
                 expected("hex id")
-            case [id, *rest]:
-                check_overflow(rest[3:])
+            case [id]:
+                expected("tag")
+            case [id, tag, *rest]:
+                check_overflow(rest[2:])
             case _:
                 raise NotImplementedError
         
-        tag, note, time = unpack(rest, "", None, "")
+        note, time = unpack(rest, None, "")
         try:
             ts = datetime.fromisoformat(time) if time else None
         except ValueError:
