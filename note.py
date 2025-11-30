@@ -676,7 +676,7 @@ class NoteApp:
                 if note:
                     note = note.lower()
                 if note not in data.config.limit[tag] and not self.force:
-                    raise CmdError(f"Tag {tag!r} note must be one of {data.config.limit[tag]}.")
+                    raise CmdError(f"Note {tag!r} must be one of {data.config.limit[tag]}.")
             
             if dt is None:
                 # If no time is given, check if the note is a time.
@@ -795,16 +795,15 @@ class NoteApp:
             if rows := data.most_recent(tag, count, note):
                 for row in reversed(rows):
                     row.print(True)
+                data.insert(datetime.now(), "last", f"{tag}\t{note}")
             else:
                 print("No notes found.")
 
     def subcmd_edit(self, *args: str):
         '''
-        <id> [tag] [note] [time]
+        <id> <tag> [note] [time]
         
-        Edit a note. If a hex id is provided, edit that particular note.
-        Otherwise, this searches for the last note with that tag within the
-        last hour. This does not check for tag validity, and will automatically undelete the note if it was deleted.
+        Edit a note using its id to locate it. This does not check for tag validity, and will automatically undelete the note if it was deleted.
         '''
         match args:
             case []:
