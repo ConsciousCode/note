@@ -415,7 +415,8 @@ class NoteDataConn:
                 base = datetime.now().replace(minute=int(dt[2]))
                 if sec := dt[3]:
                     base = base.replace(second=int(sec))
-                # Adjust for 12-hour time
+                
+                # If > 12 we know it's 24 hour time, no adjustment needed.
                 if hour <= 12:
                     match dt[4]:
                         case 'am':
@@ -423,7 +424,6 @@ class NoteDataConn:
                         case 'pm':
                             hour += 12
                         
-                        # If > 12 we know it's 24 hour time, no adjustment needed.
                         # Otherwise ambiguous 12-hour am/pm
                         case _:
                             candidates: list[datetime] = []
@@ -440,7 +440,12 @@ class NoteDataConn:
                             
                             # Most recent time that was the hour
                             hour = max(candidates).hour
+                
+                # Future hour, must be from the previous day
+                if base.hour < hour:
+                    base -= timedelta(days=1)
                 base = base.replace(hour=hour)
+
             elif sb in self.config.may or sb in self.config.must:
                 match ts[2]:
                     case ">"|"after":
